@@ -26,12 +26,8 @@ dp = Dispatcher(storage=storage)
 ADMIN_IDS = [1730848079, 713476634]
 CHELYABINSK_CENTER = (55.159897, 61.402554)
 
-PRICE_PHOTOS = {
-    'tech_plan': '(Прайс тех.план).JPG',
-    'acts': '(Прайс Акты, справки).JPG',
-    'surveying': '(Прайс межевание).JPG',
-    'tech_passport': '(Прайс тех.паспорт).JPG'
-}
+# Путь к файлам прайсов (в той же папке что и бот)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 class Form(StatesGroup):
@@ -58,2130 +54,1790 @@ class Form(StatesGroup):
     waiting_for_expertise_stage = State()
     waiting_for_expertise_object = State()
     waiting_for_expertise_status = State()
-    waiting_for_expertise_tasks = State()
+    waiting_for_expertise_goals = State()
     waiting_for_expertise_description = State()
     waiting_for_expertise_photos = State()
     waiting_for_acceptance_state = State()
     waiting_for_acceptance_material = State()
     waiting_for_acceptance_area = State()
-    waiting_for_inspection_object = State()
     waiting_for_inspection_area = State()
     waiting_for_inspection_material = State()
     waiting_for_inspection_finish = State()
     waiting_for_thermal_object = State()
     waiting_for_thermal_area = State()
     waiting_for_deals_service = State()
+    waiting_for_insurance_life_info = State()
 
+
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 
 def calculate_distance(lat1, lon1, lat2, lon2):
     R = 6371
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
-    a = (math.sin(dlat / 2) * math.sin(dlat / 2) +
-         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
-         math.sin(dlon / 2) * math.sin(dlon / 2))
+    a = (math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(
+        dlon / 2) ** 2)
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
 
 def is_in_chelyabinsk(full_address: str) -> bool:
-    """Проверяет, находится ли адрес в городе Челябинск"""
     if not full_address:
         return False
-
-    address_lower = full_address.lower()
-
-    # Проверяем, что это именно город Челябинск, а не область
-    if 'челябинск,' in address_lower or 'челябинск ' in address_lower:
-        # Исключаем Челябинскую область
-        if 'челябинская область' in address_lower and 'челябинск,' not in address_lower:
+    addr = full_address.lower()
+    if 'челябинск,' in addr or 'челябинск ' in addr:
+        if 'челябинская область' in addr and 'челябинск,' not in addr:
             return False
         return True
-
     return False
 
 
 async def geocode_address(address: str):
     try:
-        formatted_address = format_address_for_geocoder(address)
+        formatted = address if any(c in address.lower() for c in ['челябинск', 'миасс', 'златоуст', 'копейск',
+                                                                  'магнитогорск']) else f"Челябинск, {address}"
         async with aiohttp.ClientSession() as session:
-            url = "https://geocode-maps.yandex.ru/1.x/"
-            params = {
-                "apikey": "61f30bb9-04d7-4eb9-8636-908c6f611e4c",
-                "geocode": formatted_address,
-                "format": "json",
-                "results": 1
-            }
-            logger.info(f"Geocoding: {formatted_address}")
-            async with session.get(url, params=params, timeout=10) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    try:
-                        feature_member = data['response']['GeoObjectCollection']['featureMember']
-                        if feature_member:
-                            geo_object = feature_member[0]['GeoObject']
-                            pos = geo_object['Point']['pos']
-                            lon, lat = map(float, pos.split())
-                            full_address = geo_object.get('metaDataProperty', {}).get('GeocoderMetaData', {}).get(
-                                'text', 'Неизвестно')
-                            logger.info(f"Success: {full_address} -> ({lat}, {lon})")
-                            return lat, lon, full_address
-                    except (KeyError, IndexError, ValueError) as e:
-                        logger.error(f"Parse error: {e}")
+            params = {"apikey": "61f30bb9-04d7-4eb9-8636-908c6f611e4c", "geocode": formatted, "format": "json",
+                      "results": 1}
+            async with session.get("https://geocode-maps.yandex.ru/1.x/", params=params, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    members = data.get('response', {}).get('GeoObjectCollection', {}).get('featureMember', [])
+                    if members:
+                        obj = members[0]['GeoObject']
+                        lon, lat = map(float, obj['Point']['pos'].split())
+                        full_addr = obj.get('metaDataProperty', {}).get('GeocoderMetaData', {}).get('text', '')
+                        return lat, lon, full_addr
     except Exception as e:
         logger.error(f"Geocoding error: {e}")
     return None, None, None
 
 
-def format_address_for_geocoder(address: str) -> str:
-    address_lower = address.lower()
-    cities = ['челябинск', 'миасс', 'златоуст', 'копейск', 'магнитогорск',
-              'сатка', 'озёрск', 'трёхгорный', 'южноуральск', 'коркино']
-    city_in_address = any(city in address_lower for city in cities)
-    if not city_in_address:
-        return f"Челябинск, {address}"
-    return address
-
-
-async def send_to_admins(text: str, user_info: str = None):
-    message_text = f"🔔 <b>НОВАЯ ЗАЯВКА</b>\n\n{text}"
-    if user_info:
-        message_text += f"\n\n👤 <b>От пользователя:</b>\n{user_info}"
-
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(admin_id, message_text, parse_mode="HTML")
-        except Exception as e:
-            logger.error(f"Failed to send message to admin {admin_id}: {e}")
-
-
 def get_user_info(user) -> str:
-    info = f"ID: {user.id}\n"
+    info = f"ID: <code>{user.id}</code>\n"
     if user.username:
         info += f"Username: @{user.username}\n"
-    info += f"Имя: {user.first_name or 'Не указано'}"
+        info += f"Профиль: <a href='https://t.me/{user.username}'>Открыть чат</a>\n"
+    else:
+        info += f"Профиль: <a href='tg://user?id={user.id}'>Открыть чат</a>\n"
+    name = user.first_name or ''
     if user.last_name:
-        info += f" {user.last_name}"
+        name += f" {user.last_name}"
+    info += f"Имя: {name or 'Не указано'}"
     return info
 
 
-def get_back_button():
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="back")]])
+def get_address_hint() -> str:
+    return (
+        "📍 <b>Введите адрес:</b>\n\n"
+        "Формат: <code>Город, улица, дом, квартира</code>\n"
+        "Пример: <code>Челябинск, Ленина 21, кв 44</code>\n\n"
+        "Или кадастровый номер:\n"
+        "Пример: <code>74:27:0801001:1234</code>\n\n"
+        "💡 Если город не указан — будет Челябинск"
+    )
 
+
+async def send_to_admins(text: str, user_info: str = None):
+    msg = f"🔔 <b>НОВАЯ ЗАЯВКА</b>\n{'━' * 20}\n\n{text}"
+    if user_info:
+        msg += f"\n\n👤 <b>Клиент:</b>\n{user_info}"
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, msg, parse_mode="HTML", disable_web_page_preview=True)
+        except Exception as e:
+            logger.error(f"Admin {admin_id} error: {e}")
+
+
+async def send_documents_to_admins(documents: list, user_info: str, order_info: str):
+    if not documents:
+        return
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"📎 <b>Документы к заявке:</b>\n{'━' * 20}\n\n{order_info}\n\n👤 <b>Клиент:</b>\n{user_info}",
+                parse_mode="HTML", disable_web_page_preview=True
+            )
+            for doc in documents:
+                try:
+                    if doc['type'] == 'photo':
+                        await bot.send_photo(admin_id, doc['file_id'], caption=doc.get('caption', ''))
+                    elif doc['type'] == 'document':
+                        await bot.send_document(admin_id, doc['file_id'], caption=doc.get('caption', ''))
+                except Exception as e:
+                    logger.error(f"Doc send error: {e}")
+        except Exception as e:
+            logger.error(f"Admin {admin_id} docs error: {e}")
+
+
+async def send_price_image(message_or_callback, image_name: str, caption: str = None):
+    """Отправка картинки прайса"""
+    image_path = os.path.join(SCRIPT_DIR, image_name)
+    if os.path.exists(image_path):
+        try:
+            photo = FSInputFile(image_path)
+            if isinstance(message_or_callback, CallbackQuery):
+                await message_or_callback.message.answer_photo(photo, caption=caption)
+            else:
+                await message_or_callback.answer_photo(photo, caption=caption)
+        except Exception as e:
+            logger.error(f"Price image error: {e}")
+
+
+# ========== КЛАВИАТУРЫ ==========
 
 def get_main_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💎 Оценка недвижимости", callback_data="service_1")],
         [InlineKeyboardButton(text="💧 Оценка ущерба после затопления", callback_data="service_2")],
         [InlineKeyboardButton(text="📋 БТИ / Кадастр / Межевание", callback_data="service_3")],
-        [InlineKeyboardButton(text="🔨 Строительно-техническая экспертиза / Обследования", callback_data="service_4")],
-        [InlineKeyboardButton(text="🛡️ Ипотечное страхование", callback_data="service_5")],
+        [InlineKeyboardButton(text="🔨 Экспертиза / Обследования", callback_data="service_4")],
+        [InlineKeyboardButton(text="🛡 Ипотечное страхование", callback_data="service_5")],
         [InlineKeyboardButton(text="🏢 Сделки с недвижимостью", callback_data="service_6")],
-        [InlineKeyboardButton(text="✉️ Написать нам напрямую", url="https://t.me/+79080415241")]
+        [InlineKeyboardButton(text="✉ Написать напрямую", url="https://t.me/+79080415241")]
     ])
 
 
-def get_bti_services_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📄 Выписка из технического паспорта", callback_data="bti_1")],
-        [InlineKeyboardButton(text="📋 Технический паспорт", callback_data="bti_2")],
-        [InlineKeyboardButton(text="📐 Технический план", callback_data="bti_3")],
-        [InlineKeyboardButton(text="🗺️ Межевание (земля)", callback_data="bti_4")],
-        [InlineKeyboardButton(text="📑 Акты, справки", callback_data="bti_5")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
+def get_main_menu_button():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]])
 
 
-def get_bti_object_types_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏠 Квартира", callback_data="bti_object_flat")],
-        [InlineKeyboardButton(text="🏡 Жилой дом", callback_data="bti_object_house")],
-        [InlineKeyboardButton(text="🏢 Нежилое помещение", callback_data="bti_object_nonres")],
-        [InlineKeyboardButton(text="🚗 Гараж", callback_data="bti_object_garage")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_tech_plan_options():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💰 Узнать стоимость", callback_data="tech_plan_price")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_tech_plan_objects():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏠 Квартира, комната", callback_data="tech_plan_obj_1")],
-        [InlineKeyboardButton(text="🏡 Жилой дом/садовый дом/таунхаус", callback_data="tech_plan_obj_2")],
-        [InlineKeyboardButton(text="🏢 Нежилое помещение", callback_data="tech_plan_obj_3")],
-        [InlineKeyboardButton(text="🏭 Нежилое здание", callback_data="tech_plan_obj_4")],
-        [InlineKeyboardButton(text="🚗 Гараж", callback_data="tech_plan_obj_5")],
-        [InlineKeyboardButton(text="🔀 Раздел дома", callback_data="tech_plan_obj_6")],
-        [InlineKeyboardButton(text="🔗 Раздел/объединение помещений", callback_data="tech_plan_obj_7")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_surveying_options():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💰 Узнать стоимость", callback_data="surveying_price")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_surveying_services():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📏 Уточнение границ зем. участка", callback_data="surv_serv_1")],
-        [InlineKeyboardButton(text="✂️ Раздел/объединение участка", callback_data="surv_serv_2")],
-        [InlineKeyboardButton(text="📋 Схема для КУиЗО", callback_data="surv_serv_3")],
-        [InlineKeyboardButton(text="🔄 Перераспределение (межевой)", callback_data="surv_serv_4")],
-        [InlineKeyboardButton(text="🔄📋 Перераспределение (схема + межевой)", callback_data="surv_serv_5")],
-        [InlineKeyboardButton(text="🚗 Схема под гараж", callback_data="surv_serv_6")],
-        [InlineKeyboardButton(text="📄 Межевой по распоряжению", callback_data="surv_serv_7")],
-        [InlineKeyboardButton(text="⚖️ Межевой для суда", callback_data="surv_serv_8")],
-        [InlineKeyboardButton(text="🔒 Межевой на сервитут", callback_data="surv_serv_9")],
-        [InlineKeyboardButton(text="➕ Другое", callback_data="surv_serv_other")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_acts_options():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💰 Узнать стоимость", callback_data="acts_price")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_acts_services():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📄 Документы на акт ввода до 1500 кв.м", callback_data="acts_serv_1")],
-        [InlineKeyboardButton(text="🚗 На гараж", callback_data="acts_serv_2")],
-        [InlineKeyboardButton(text="🗑️ Акт сноса", callback_data="acts_serv_3")],
-        [InlineKeyboardButton(text="📍 Справка о местоположении (комната)", callback_data="acts_serv_4")],
-        [InlineKeyboardButton(text="💰 Справка о стоимости", callback_data="acts_serv_5")],
-        [InlineKeyboardButton(text="📝 Заполнение уведомлений", callback_data="acts_serv_6")],
-        [InlineKeyboardButton(text="➕ Другое", callback_data="acts_serv_other")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_tech_passport_options():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💰 Узнать стоимость", callback_data="tech_passport_price")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_expertise_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔍 Строительно-техническая экспертиза", callback_data="expertise_1")],
-        [InlineKeyboardButton(text="🏡 Приемка жилого дома от застройщика", callback_data="expertise_2")],
-        [InlineKeyboardButton(text="🏠 Техническое обследование перед покупкой", callback_data="expertise_3")],
-        [InlineKeyboardButton(text="🌡️ Тепловизионное обследование", callback_data="expertise_4")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_expertise_stage_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚖️ Идёт судебный процесс", callback_data="exp_stage_1")],
-        [InlineKeyboardButton(text="📝 Досудебное урегулирование", callback_data="exp_stage_2")],
-        [InlineKeyboardButton(text="❓ Затрудняюсь ответить", callback_data="exp_stage_3")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_expertise_object_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏠 Квартира", callback_data="exp_obj_1")],
-        [InlineKeyboardButton(text="🏡 Жилой дом / коттедж", callback_data="exp_obj_2")],
-        [InlineKeyboardButton(text="🏢 Коммерческий объект", callback_data="exp_obj_3")],
-        [InlineKeyboardButton(text="🏚️ Кровля", callback_data="exp_obj_4")],
-        [InlineKeyboardButton(text="🏗️ Фундамент", callback_data="exp_obj_5")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_expertise_status_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Построен", callback_data="exp_status_1")],
-        [InlineKeyboardButton(text="🚧 В процессе строительства", callback_data="exp_status_2")],
-        [InlineKeyboardButton(text="🔧 После ремонта / реконструкции", callback_data="exp_status_3")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_acceptance_state_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔨 Черновая (без отделки)", callback_data="acc_state_1")],
-        [InlineKeyboardButton(text="🎨 Предчистовая", callback_data="acc_state_2")],
-        [InlineKeyboardButton(text="✨ Чистовая (с отделкой)", callback_data="acc_state_3")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_acceptance_material_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🧱 Кирпич", callback_data="acc_mat_1")],
-        [InlineKeyboardButton(text="🏗️ Ж/б панели", callback_data="acc_mat_2")],
-        [InlineKeyboardButton(text="🔲 Блочный", callback_data="acc_mat_3")],
-        [InlineKeyboardButton(text="🌲 Дерево", callback_data="acc_mat_4")],
-        [InlineKeyboardButton(text="➕ Другой", callback_data="acc_mat_other")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_acceptance_area_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="до 150 кв.м", callback_data="acc_area_1")],
-        [InlineKeyboardButton(text="150-250 кв.м", callback_data="acc_area_2")],
-        [InlineKeyboardButton(text="250-500 кв.м", callback_data="acc_area_3")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_inspection_area_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="до 150 кв.м", callback_data="insp_area_1")],
-        [InlineKeyboardButton(text="150-250 кв.м", callback_data="insp_area_2")],
-        [InlineKeyboardButton(text="250-350 кв.м", callback_data="insp_area_3")],
-        [InlineKeyboardButton(text="свыше 350 кв.м", callback_data="insp_area_4")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_inspection_material_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🧱 Кирпич", callback_data="insp_mat_1")],
-        [InlineKeyboardButton(text="🏗️ Ж/б панели", callback_data="insp_mat_2")],
-        [InlineKeyboardButton(text="🔲 Блочный", callback_data="insp_mat_3")],
-        [InlineKeyboardButton(text="🌲 Дерево", callback_data="insp_mat_4")],
-        [InlineKeyboardButton(text="➕ Другой", callback_data="insp_mat_other")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_inspection_finish_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔨 Черновая (без отделки)", callback_data="insp_fin_1")],
-        [InlineKeyboardButton(text="🎨 Предчистовая", callback_data="insp_fin_2")],
-        [InlineKeyboardButton(text="✨ Чистовая (с отделкой)", callback_data="insp_fin_3")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_thermal_object_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏠 Квартира", callback_data="therm_obj_1")],
-        [InlineKeyboardButton(text="🏡 Жилой дом", callback_data="therm_obj_2")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_thermal_area_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="до 100 кв.м", callback_data="therm_area_1")],
-        [InlineKeyboardButton(text="100-200 кв.м", callback_data="therm_area_2")],
-        [InlineKeyboardButton(text="200-300 кв.м", callback_data="therm_area_3")],
-        [InlineKeyboardButton(text="свыше 300 кв.м", callback_data="therm_area_4")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_insurance_type_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🆕 Новая ипотека", callback_data="insurance_new")],
-        [InlineKeyboardButton(text="🔄 Продление договора", callback_data="insurance_renewal")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_insurance_coverage_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏠 Недвижимость (конструктив)", callback_data="coverage_property")],
-        [InlineKeyboardButton(text="❤️ Жизнь", callback_data="coverage_life")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_insurance_object_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏠 Квартира, комната", callback_data="ins_object_1")],
-        [InlineKeyboardButton(text="🏡 Жилой дом/садовый дом/таунхаус", callback_data="ins_object_2")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_deals_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📑 Выписки из ЕГРН", callback_data="deals_egrn")],
-        [InlineKeyboardButton(text="📊 Анализ сделок за квартал", callback_data="deals_analysis")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_evaluation_purpose_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏦 Для банка (ипотека)", callback_data="purpose_1.1")],
-        [InlineKeyboardButton(text="👨‍👩‍👧 Для органов опеки", callback_data="purpose_1.2")],
-        [InlineKeyboardButton(text="⚖️ Для нотариуса", callback_data="purpose_1.3")],
-        [InlineKeyboardButton(text="🏛️ Для суда", callback_data="purpose_1.4")],
-        [InlineKeyboardButton(text="🤝 Для купли-продажи", callback_data="purpose_1.5")],
-        [InlineKeyboardButton(text="📝 Иная цель", callback_data="purpose_1.6")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_banks_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Сбербанк", callback_data="bank_Сбербанк"),
-         InlineKeyboardButton(text="ВТБ", callback_data="bank_ВТБ")],
-        [InlineKeyboardButton(text="Дом.РФ", callback_data="bank_Дом.РФ"),
-         InlineKeyboardButton(text="Россельхозбанк", callback_data="bank_Россельхозбанк")],
-        [InlineKeyboardButton(text="Альфа-Банк", callback_data="bank_Альфа-Банк"),
-         InlineKeyboardButton(text="Совкомбанк", callback_data="bank_Совкомбанк")],
-        [InlineKeyboardButton(text="Газпромбанк", callback_data="bank_Газпромбанк"),
-         InlineKeyboardButton(text="Промсвязьбанк", callback_data="bank_Промсвязьбанк")],
-        [InlineKeyboardButton(text="ПримСоцБанк", callback_data="bank_ПримСоцБанк"),
-         InlineKeyboardButton(text="Уралсиб", callback_data="bank_Уралсиб")],
-        [InlineKeyboardButton(text="АК Барс Банк", callback_data="bank_АК Барс Банк"),
-         InlineKeyboardButton(text="Райффайзенбанк", callback_data="bank_Райффайзенбанк")],
-        [InlineKeyboardButton(text="Челябинвестбанк", callback_data="bank_Челябинвестбанк"),
-         InlineKeyboardButton(text="УБРиР", callback_data="bank_УБРиР")],
-        [InlineKeyboardButton(text="Ипотека24", callback_data="bank_Ипотека24"),
-         InlineKeyboardButton(text="Новикомбанк", callback_data="bank_Новикомбанк")],
-        [InlineKeyboardButton(text="Евразийский банк", callback_data="bank_Евразийский банк"),
-         InlineKeyboardButton(text="Росвоенипотека", callback_data="bank_Росвоенипотека")],
-        [InlineKeyboardButton(text="Уралпромбанк", callback_data="bank_Уралпромбанк"),
-         InlineKeyboardButton(text="Другой банк", callback_data="bank_Другой")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_mortgage_purpose_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏠 Оформление ипотеки", callback_data="mortgage_1")],
-        [InlineKeyboardButton(text="📝 Оформление закладной", callback_data="mortgage_2")],
-        [InlineKeyboardButton(text="🔄 Рефинансирование", callback_data="mortgage_3")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_object_types_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏠 Квартира, комната", callback_data="object_1")],
-        [InlineKeyboardButton(text="🌳 Земельный участок", callback_data="object_2")],
-        [InlineKeyboardButton(text="🏡 Жилой дом/садовый дом/таунхаус", callback_data="object_3")],
-        [InlineKeyboardButton(text="🏢 Нежилое помещение", callback_data="object_4")],
-        [InlineKeyboardButton(text="🏭 Нежилое здание", callback_data="object_5")],
-        [InlineKeyboardButton(text="🚗 Гараж", callback_data="object_6")],
-        [InlineKeyboardButton(text="🅿️ Машиноместо", callback_data="object_7")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_flood_object_types():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏠 Квартира, комната", callback_data="flood_1")],
-        [InlineKeyboardButton(text="🏡 Жилой дом/садовый дом/таунхаус", callback_data="flood_2")],
-        [InlineKeyboardButton(text="🏢 Нежилое помещение", callback_data="flood_3")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
-
-
-def get_report_type_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📄 Краткая справка", callback_data="report_1")],
-        [InlineKeyboardButton(text="📊 Отчет об оценке", callback_data="report_2")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
-    ])
+def get_back_button(callback_data="back"):
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀ Назад", callback_data=callback_data)]])
 
 
 def get_documents_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📎 Прикрепить документы", callback_data="attach_docs")],
-        [InlineKeyboardButton(text="✅ Отправить без документов", callback_data="submit_no_docs")]
+        [InlineKeyboardButton(text="✅ Отправить заявку", callback_data="submit_order")]
     ])
 
 
-def get_main_menu_button():
+def get_finish_docs_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
+        [InlineKeyboardButton(text="✅ Готово, отправить заявку", callback_data="submit_order")],
+        [InlineKeyboardButton(text="📎 Добавить ещё", callback_data="add_more_docs")]
     ])
 
 
-def calculate_mortgage_cost(bank, object_type, mortgage_purpose, distance_km, in_city):
-    """
-    Расчет стоимости для ипотеки
-    in_city: True если объект в Челябинске
-    """
-    group1 = ['Сбербанк', 'Россельхозбанк', 'Челябинвестбанк', 'Росвоенипотека']
-    group2 = ['ВТБ', 'ПримСоцБанк', 'Дом.РФ', 'Альфа-Банк']
+def get_evaluation_purpose_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏦 Для банка (ипотека)", callback_data="purpose_bank")],
+        [InlineKeyboardButton(text="👨‍👩‍👧 Для органов опеки", callback_data="purpose_opeka")],
+        [InlineKeyboardButton(text="⚖ Для нотариуса", callback_data="purpose_notary")],
+        [InlineKeyboardButton(text="🏛 Для суда", callback_data="purpose_court")],
+        [InlineKeyboardButton(text="🤝 Для купли-продажи", callback_data="purpose_sale")],
+        [InlineKeyboardButton(text="📝 Иная цель", callback_data="purpose_other")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
 
-    base_price = 0
 
-    if object_type == "Квартира, комната":
-        if mortgage_purpose == "Оформление ипотеки":
-            base_price = 2500 if bank in group1 else 2900
-        elif mortgage_purpose == "Оформление закладной":
-            if bank in group2:
-                base_price = 4000
+# Полный список банков из ТЗ
+def get_banks_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Сбербанк", callback_data="bank_sber"),
+         InlineKeyboardButton(text="ВТБ", callback_data="bank_vtb")],
+        [InlineKeyboardButton(text="Дом.РФ", callback_data="bank_domrf"),
+         InlineKeyboardButton(text="Россельхозбанк", callback_data="bank_rshb")],
+        [InlineKeyboardButton(text="Альфа-Банк", callback_data="bank_alfa"),
+         InlineKeyboardButton(text="Совкомбанк", callback_data="bank_sovkom")],
+        [InlineKeyboardButton(text="Газпромбанк", callback_data="bank_gazprom"),
+         InlineKeyboardButton(text="ПСБ", callback_data="bank_psb")],
+        [InlineKeyboardButton(text="ПримСоцБанк", callback_data="bank_primsoc"),
+         InlineKeyboardButton(text="Уралсиб", callback_data="bank_uralsib")],
+        [InlineKeyboardButton(text="АК Барс Банк", callback_data="bank_akbars"),
+         InlineKeyboardButton(text="Райффайзен", callback_data="bank_raif")],
+        [InlineKeyboardButton(text="Челябинвестбанк", callback_data="bank_chelinvest"),
+         InlineKeyboardButton(text="УБРиР", callback_data="bank_ubrir")],
+        [InlineKeyboardButton(text="Ипотека24", callback_data="bank_ipoteka24"),
+         InlineKeyboardButton(text="Новикомбанк", callback_data="bank_novikom")],
+        [InlineKeyboardButton(text="Евразийский банк", callback_data="bank_evraz"),
+         InlineKeyboardButton(text="Росвоенипотека", callback_data="bank_rosvoen")],
+        [InlineKeyboardButton(text="Уралпромбанк", callback_data="bank_uralprom"),
+         InlineKeyboardButton(text="Другой банк", callback_data="bank_other")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
+
+
+def get_mortgage_purpose_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 Оформление ипотеки", callback_data="mpurpose_new")],
+        [InlineKeyboardButton(text="📝 Оформление закладной", callback_data="mpurpose_zaklad")],
+        [InlineKeyboardButton(text="🔄 Рефинансирование", callback_data="mpurpose_refi")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
+
+
+# Полный список объектов из ТЗ (7 пунктов)
+def get_object_types_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 Квартира, комната", callback_data="obj_flat")],
+        [InlineKeyboardButton(text="🌳 Земельный участок", callback_data="obj_land")],
+        [InlineKeyboardButton(text="🏡 Дом/таунхаус", callback_data="obj_house")],
+        [InlineKeyboardButton(text="🏢 Нежилое помещение", callback_data="obj_commercial")],
+        [InlineKeyboardButton(text="🏭 Нежилое здание с ЗУ", callback_data="obj_building")],
+        [InlineKeyboardButton(text="🚗 Гараж", callback_data="obj_garage")],
+        [InlineKeyboardButton(text="🅿 Машиноместо", callback_data="obj_parking")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
+
+
+def get_report_type_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📄 Краткая справка", callback_data="report_short")],
+        [InlineKeyboardButton(text="📊 Отчёт об оценке", callback_data="report_full")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
+
+
+def get_flood_objects_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 Квартира, комната", callback_data="flood_flat")],
+        [InlineKeyboardButton(text="🏡 Дом/таунхаус", callback_data="flood_house")],
+        [InlineKeyboardButton(text="🏢 Нежилое помещение", callback_data="flood_commercial")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
+
+
+# БТИ меню
+def get_bti_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📄 Выписка из техпаспорта", callback_data="bti_extract")],
+        [InlineKeyboardButton(text="📋 Технический паспорт", callback_data="bti_passport")],
+        [InlineKeyboardButton(text="📐 Технический план", callback_data="bti_plan")],
+        [InlineKeyboardButton(text="🗺 Межевание (земля)", callback_data="bti_survey")],
+        [InlineKeyboardButton(text="📑 Акты, справки", callback_data="bti_acts")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
+
+
+# Для тех.паспорта и тех.плана - кнопка с прайсом
+def get_bti_price_menu(service_type):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 Узнать стоимость", callback_data=f"bti_price_{service_type}")],
+        [InlineKeyboardButton(text="📝 Ввести адрес", callback_data=f"bti_address_{service_type}")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
+
+
+# Объекты для тех.плана (расширенный список)
+def get_bti_plan_objects_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 Квартира, комната", callback_data="btiplan_flat")],
+        [InlineKeyboardButton(text="🏡 Жилой/садовый дом", callback_data="btiplan_house")],
+        [InlineKeyboardButton(text="🏢 Нежилое помещение", callback_data="btiplan_commercial")],
+        [InlineKeyboardButton(text="🏭 Нежилое здание", callback_data="btiplan_building")],
+        [InlineKeyboardButton(text="🚗 Гараж", callback_data="btiplan_garage")],
+        [InlineKeyboardButton(text="🏠➗ Раздел дома", callback_data="btiplan_split_house")],
+        [InlineKeyboardButton(text="🔀 Раздел/объединение помещений", callback_data="btiplan_split_rooms")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
+
+
+# Межевание - услуги
+def get_survey_services_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📏 Уточнение границ ЗУ", callback_data="surv_borders")],
+        [InlineKeyboardButton(text="✂ Раздел/объединение участка", callback_data="surv_split")],
+        [InlineKeyboardButton(text="📋 Схема для КУиЗО", callback_data="surv_kuizo")],
+        [InlineKeyboardButton(text="🔄 Перераспределение (межевой)", callback_data="surv_redistr")],
+        [InlineKeyboardButton(text="🔄 Перераспределение (схема+межевой)", callback_data="surv_redistr_full")],
+        [InlineKeyboardButton(text="🚗 Схема под гараж", callback_data="surv_garage")],
+        [InlineKeyboardButton(text="📑 Межевой по распоряжению", callback_data="surv_order")],
+        [InlineKeyboardButton(text="⚖ Межевой для суда", callback_data="surv_court")],
+        [InlineKeyboardButton(text="🔗 Межевой на сервитут", callback_data="surv_servitude")],
+        [InlineKeyboardButton(text="➕ Другое", callback_data="surv_other")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
+
+
+# Акты, справки - услуги
+def get_acts_services_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📄 Акт ввода до 1500 кв.м", callback_data="acts_input")],
+        [InlineKeyboardButton(text="🚗 На гараж", callback_data="acts_garage")],
+        [InlineKeyboardButton(text="🗑 Акт сноса", callback_data="acts_demolish")],
+        [InlineKeyboardButton(text="📍 Справка о местоположении", callback_data="acts_location")],
+        [InlineKeyboardButton(text="💰 Справка о стоимости", callback_data="acts_cost")],
+        [InlineKeyboardButton(text="📝 Заполнение уведомлений", callback_data="acts_notify")],
+        [InlineKeyboardButton(text="➕ Другое", callback_data="acts_other")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
+
+
+# Экспертиза меню
+def get_expertise_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Строительно-техническая экспертиза", callback_data="exp_build")],
+        [InlineKeyboardButton(text="🏡 Приёмка дома от застройщика", callback_data="exp_accept")],
+        [InlineKeyboardButton(text="🏠 Обследование перед покупкой", callback_data="exp_inspect")],
+        [InlineKeyboardButton(text="🌡 Тепловизионное обследование", callback_data="exp_thermal")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
+
+
+def get_expertise_stage_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚖ Уже идёт судебный процесс", callback_data="expstage_court")],
+        [InlineKeyboardButton(text="📝 Досудебное урегулирование", callback_data="expstage_pretrial")],
+        [InlineKeyboardButton(text="❓ Затрудняюсь ответить", callback_data="expstage_unknown")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
+
+
+def get_expertise_object_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 Квартира", callback_data="expobj_flat")],
+        [InlineKeyboardButton(text="🏡 Жилой дом / коттедж", callback_data="expobj_house")],
+        [InlineKeyboardButton(text="🏢 Помещение / офис / коммерческий", callback_data="expobj_commercial")],
+        [InlineKeyboardButton(text="🏚 Кровля", callback_data="expobj_roof")],
+        [InlineKeyboardButton(text="🏗 Фундамент", callback_data="expobj_foundation")],
+        [InlineKeyboardButton(text="➕ Другое", callback_data="expobj_other")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
+
+
+def get_expertise_status_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Построен", callback_data="expstat_built")],
+        [InlineKeyboardButton(text="🚧 В процессе строительства", callback_data="expstat_building")],
+        [InlineKeyboardButton(text="🔧 После ремонта / реконструкции", callback_data="expstat_renovated")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
+
+
+def get_expertise_goals_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Выявить дефекты и нарушения", callback_data="expgoal_defects")],
+        [InlineKeyboardButton(text="💰 Рассчитать стоимость устранения", callback_data="expgoal_cost")],
+        [InlineKeyboardButton(text="📊 Оценить объём работ", callback_data="expgoal_volume")],
+        [InlineKeyboardButton(text="📋 Проверить соответствие документации", callback_data="expgoal_docs")],
+        [InlineKeyboardButton(text="⚖ Подтвердить/опровергнуть претензии", callback_data="expgoal_claims")],
+        [InlineKeyboardButton(text="🏗 Комплексное обследование", callback_data="expgoal_complex")],
+        [InlineKeyboardButton(text="➕ Другое", callback_data="expgoal_other")],
+        [InlineKeyboardButton(text="✅ Продолжить", callback_data="expgoal_done")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
+
+
+# Приёмка от застройщика
+def get_acceptance_finish_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔨 Черновая (без отделки)", callback_data="accfin_rough")],
+        [InlineKeyboardButton(text="🎨 Предчистовая", callback_data="accfin_pre")],
+        [InlineKeyboardButton(text="✨ Чистовая (с отделкой)", callback_data="accfin_final")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
+
+
+def get_acceptance_material_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧱 Кирпич", callback_data="accmat_brick")],
+        [InlineKeyboardButton(text="🏗 Ж/б панели", callback_data="accmat_panel")],
+        [InlineKeyboardButton(text="🔲 Блочный (газо/пеноблок)", callback_data="accmat_block")],
+        [InlineKeyboardButton(text="🌲 Дерево", callback_data="accmat_wood")],
+        [InlineKeyboardButton(text="➕ Другой", callback_data="accmat_other")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
+
+
+def get_acceptance_area_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="до 150 м²", callback_data="accarea_150")],
+        [InlineKeyboardButton(text="150-250 м²", callback_data="accarea_250")],
+        [InlineKeyboardButton(text="250-500 м²", callback_data="accarea_500")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
+
+
+# Обследование перед покупкой
+def get_inspection_area_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="до 150 м²", callback_data="insparea_150")],
+        [InlineKeyboardButton(text="150-250 м²", callback_data="insparea_250")],
+        [InlineKeyboardButton(text="250-350 м²", callback_data="insparea_350")],
+        [InlineKeyboardButton(text="свыше 350 м²", callback_data="insparea_350plus")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
+
+
+def get_inspection_material_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧱 Кирпич", callback_data="inspmat_brick")],
+        [InlineKeyboardButton(text="🏗 Ж/б панели", callback_data="inspmat_panel")],
+        [InlineKeyboardButton(text="🔲 Блочный (газо/пеноблок)", callback_data="inspmat_block")],
+        [InlineKeyboardButton(text="🌲 Дерево", callback_data="inspmat_wood")],
+        [InlineKeyboardButton(text="➕ Другой", callback_data="inspmat_other")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
+
+
+def get_inspection_finish_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔨 Черновая (без отделки)", callback_data="inspfin_rough")],
+        [InlineKeyboardButton(text="🎨 Предчистовая", callback_data="inspfin_pre")],
+        [InlineKeyboardButton(text="✨ Чистовая (с отделкой)", callback_data="inspfin_final")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
+
+
+# Тепловизор
+def get_thermal_object_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 Квартира", callback_data="thermobj_flat")],
+        [InlineKeyboardButton(text="🏡 Жилой дом", callback_data="thermobj_house")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
+
+
+def get_thermal_area_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="до 100 м²", callback_data="thermarea_100")],
+        [InlineKeyboardButton(text="100-200 м²", callback_data="thermarea_200")],
+        [InlineKeyboardButton(text="200-300 м²", callback_data="thermarea_300")],
+        [InlineKeyboardButton(text="свыше 300 м²", callback_data="thermarea_300plus")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
+
+
+# Страхование
+def get_insurance_type_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🆕 Новая ипотека", callback_data="ins_new")],
+        [InlineKeyboardButton(text="🔄 Продление договора", callback_data="ins_renew")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
+
+
+def get_insurance_coverage_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 Недвижимость (конструктив)", callback_data="inscov_property")],
+        [InlineKeyboardButton(text="❤ Жизнь", callback_data="inscov_life")],
+        [InlineKeyboardButton(text="🏠❤ Оба варианта", callback_data="inscov_both")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
+
+
+def get_insurance_object_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 Квартира, комната", callback_data="insobj_flat")],
+        [InlineKeyboardButton(text="🏡 Дом/таунхаус", callback_data="insobj_house")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
+
+
+# Сделки
+def get_deals_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📑 Выписки из ЕГРН", callback_data="deals_egrn")],
+        [InlineKeyboardButton(text="📊 Анализ сделок за квартал", callback_data="deals_analysis")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="back")]
+    ])
+
+
+# ========== СЛОВАРИ ==========
+
+BANK_NAMES = {
+    "sber": "Сбербанк", "vtb": "ВТБ", "domrf": "Дом.РФ", "rshb": "Россельхозбанк",
+    "alfa": "Альфа-Банк", "sovkom": "Совкомбанк", "gazprom": "Газпромбанк",
+    "psb": "Промсвязьбанк", "primsoc": "ПримСоцБанк", "uralsib": "Уралсиб",
+    "akbars": "АК Барс Банк", "raif": "Райффайзенбанк", "chelinvest": "Челябинвестбанк",
+    "ubrir": "УБРиР", "ipoteka24": "Ипотека24", "novikom": "Новикомбанк",
+    "evraz": "Евразийский банк", "rosvoen": "Росвоенипотека", "uralprom": "Уралпромбанк",
+    "other": "Другой"
+}
+
+OBJECT_NAMES = {
+    "flat": "Квартира, комната", "land": "Земельный участок", "house": "Дом/таунхаус",
+    "commercial": "Нежилое помещение", "building": "Нежилое здание с ЗУ",
+    "garage": "Гараж", "parking": "Машиноместо"
+}
+
+# Группы банков для расчёта стоимости
+BANK_GROUP_1 = ['sber', 'rshb', 'chelinvest', 'rosvoen']  # 2500
+BANK_GROUP_2 = ['vtb', 'domrf', 'alfa', 'primsoc']  # Особые условия для закладной и рефи
+
+
+# ========== РАСЧЁТ СТОИМОСТИ ==========
+
+def calculate_mortgage_cost(bank_code, obj_code, purpose_code, distance_km, in_city):
+    """Расчёт стоимости оценки для банка"""
+    base = 2900  # По умолчанию
+
+    if obj_code == 'flat':
+        if purpose_code == 'new':  # Оформление ипотеки
+            base = 2500 if bank_code in BANK_GROUP_1 else 2900
+        elif purpose_code == 'zaklad':  # Закладная
+            if bank_code in BANK_GROUP_2:
+                base = 4000
             else:
-                base_price = 3000
-                # Для закладной всегда выезд = 0
-                in_city = True
-        elif mortgage_purpose == "Рефинансирование":
-            base_price = 6900 if bank in group2 else 5900
+                base = 3000
+                in_city = True  # Для остальных банков выезд = 0
+        elif purpose_code == 'refi':  # Рефинансирование
+            base = 6900 if bank_code in BANK_GROUP_2 else 5900
 
-    elif object_type == "Земельный участок":
-        if mortgage_purpose == "Оформление ипотеки":
-            base_price = 2500 if bank in group1 else 2900
-        elif mortgage_purpose == "Оформление закладной":
-            if bank in group2:
-                base_price = 4000
-            else:
-                base_price = 3000
-                in_city = True
-        elif mortgage_purpose == "Рефинансирование":
-            base_price = 6900 if bank in group2 else 5900
-
-    elif object_type == "Жилой дом/садовый дом/таунхаус":
-        if mortgage_purpose == "Рефинансирование":
-            base_price = 6900 if bank in group2 else 5900
+    elif obj_code == 'house':
+        if purpose_code == 'new':
+            base = 2500 if bank_code in BANK_GROUP_1 else 2900
+        elif purpose_code == 'refi':
+            base = 6900 if bank_code in BANK_GROUP_2 else 5900
         else:
-            base_price = 2500 if bank in group1 else 2900
+            base = 2900
 
-    elif object_type == "Нежилое помещение":
-        base_price = 6000
+    elif obj_code == 'land':
+        base = 2500 if bank_code in BANK_GROUP_1 else 2900
 
-    elif object_type == "Нежилое здание":
-        base_price = 7000
+    elif obj_code == 'commercial':
+        base = 6000
 
-    elif object_type in ["Гараж", "Машиноместо"]:
-        base_price = 3500
+    elif obj_code == 'building':
+        base = 7000
 
-    # Выезд = 0 если объект в городе
-    travel_cost = 0 if in_city else round(distance_km * 35, 2)
+    elif obj_code in ['garage', 'parking']:
+        base = 3500
 
-    return base_price, travel_cost, base_price + travel_cost
+    # Расчёт выезда
+    travel = 0 if in_city else round(distance_km * 35, 2)
+    total = base + travel
+    return base, travel, total
 
 
-def calculate_other_purpose_cost(object_type, report_type, distance_km, in_city):
-    """
-    Расчет стоимости для других целей
-    in_city: True если объект в Челябинске
-    """
-    if report_type == "Краткая справка":
-        if object_type in ["Квартира, комната", "Гараж", "Машиноместо"]:
+def calculate_other_cost(obj_code, report_code, distance_km, in_city):
+    """Расчёт стоимости оценки не для банка"""
+    if report_code == 'short':  # Краткая справка
+        if obj_code in ['flat', 'garage', 'parking', 'land']:
             return 1000, 0, 1000
-        elif object_type in ["Жилой дом/садовый дом/таунхаус", "Нежилое помещение", "Нежилое здание"]:
-            return 1500, 0, 1500
-    else:
-        base_price = 0
-        if object_type == "Квартира, комната":
-            base_price = 2500
-        elif object_type == "Земельный участок":
-            base_price = 3000
-        elif object_type == "Жилой дом/садовый дом/таунхаус":
-            base_price = 5900
-        elif object_type == "Нежилое помещение":
-            base_price = 6000
-        elif object_type == "Нежилое здание":
-            base_price = 7000
-        elif object_type in ["Гараж", "Машиноместо"]:
-            base_price = 3500
+        return 1500, 0, 1500
 
-        # Выезд = 0 если объект в городе
-        travel_cost = 0 if in_city else round(distance_km * 35, 2)
-
-        return base_price, travel_cost, base_price + travel_cost
+    # Полный отчёт
+    prices = {
+        'flat': 2500, 'land': 3000, 'house': 5900,
+        'commercial': 6000, 'building': 7000,
+        'garage': 3500, 'parking': 3500
+    }
+    base = prices.get(obj_code, 3000)
+    travel = 0 if in_city else round(distance_km * 35, 2)
+    return base, travel, base + travel
 
 
-def calculate_flood_cost(object_type, rooms_count, distance_km, in_city):
-    """
-    Расчет стоимости оценки ущерба
-    in_city: True если объект в Челябинске
-    """
-    base_price = 6000 if object_type in ["Квартира, комната", "Жилой дом/садовый дом/таунхаус"] else 7000
-    room_multiplier = 1500 if object_type in ["Квартира, комната", "Жилой дом/садовый дом/таунхаус"] else 2000
-    rooms_cost = (rooms_count - 1) * room_multiplier if rooms_count > 1 else 0
-
-    # Выезд = 0 если объект в городе
-    travel_cost = 0 if in_city else round(distance_km * 35, 2)
-
-    return base_price, rooms_cost, travel_cost, base_price + rooms_cost + travel_cost
+def calculate_flood_cost(obj_code, rooms, distance_km, in_city):
+    """Расчёт стоимости оценки ущерба от затопления"""
+    base = 7000 if obj_code == 'commercial' else 6000
+    room_price = 2000 if obj_code == 'commercial' else 1500
+    rooms_cost = (rooms - 1) * room_price if rooms > 1 else 0
+    travel = 0 if in_city else round(distance_km * 35, 2)
+    return base, rooms_cost, travel, base + rooms_cost + travel
 
 
-def calculate_insurance_cost(object_type, balance):
-    if object_type == "Квартира, комната":
-        cost = balance * 0.001
-    else:
-        cost = balance * 0.003
-    return round(cost, 2)
+def calculate_acceptance_cost(area_code, distance_km, in_city):
+    """Расчёт стоимости приёмки от застройщика"""
+    prices = {'150': 15000, '250': 18000, '500': 20000}
+    base = prices.get(area_code, 15000)
+    travel = 0 if in_city else round(distance_km * 35, 2)
+    return base, travel, base + travel
 
 
-def calculate_acceptance_cost(area, distance_km, in_city):
-    """
-    Расчет стоимости приемки
-    in_city: True если объект в Челябинске
-    """
-    if area == "до 150 кв.м":
-        base_price = 15000
-    elif area == "150-250 кв.м":
-        base_price = 18000
-    else:
-        base_price = 20000
-
-    # Выезд = 0 если объект в городе
-    travel_cost = 0 if in_city else round(distance_km * 35, 2)
-
-    return base_price, travel_cost, base_price + travel_cost
+def calculate_inspection_cost(area_code, distance_km, in_city):
+    """Расчёт стоимости обследования перед покупкой"""
+    prices = {'150': 10000, '250': 12000, '350': 15000, '350plus': 18000}
+    base = prices.get(area_code, 10000)
+    travel = 0 if in_city else round(distance_km * 35, 2)
+    return base, travel, base + travel
 
 
-def calculate_inspection_cost(area, distance_km, in_city):
-    """
-    Расчет стоимости обследования
-    in_city: True если объект в Челябинске
-    """
-    areas = {"до 150 кв.м": 10000, "150-250 кв.м": 12000, "250-350 кв.м": 15000, "свыше 350 кв.м": 18000}
-    base_price = areas.get(area, 10000)
-
-    # Выезд = 0 если объект в городе
-    travel_cost = 0 if in_city else round(distance_km * 35, 2)
-
-    return base_price, travel_cost, base_price + travel_cost
+def calculate_thermal_cost(obj_code, area_code, distance_km, in_city):
+    """Расчёт стоимости тепловизионного обследования"""
+    if obj_code == 'flat':
+        prices = {'100': 3000, '200': 3500, '300': 4000, '300plus': 4500}
+    else:  # house
+        prices = {'100': 5000, '200': 5500, '300': 6000, '300plus': 6500}
+    base = prices.get(area_code, 3000)
+    travel = 0 if in_city else round(distance_km * 35, 2)
+    return base, travel, base + travel
 
 
-def calculate_thermal_cost(object_type, area, distance_km, in_city):
-    """
-    Расчет стоимости тепловизионного обследования
-    in_city: True если объект в Челябинске
-    """
-    if object_type == "Квартира":
-        areas = {"до 100 кв.м": 3000, "100-200 кв.м": 3500, "200-300 кв.м": 4000, "свыше 300 кв.м": 4500}
-    else:
-        areas = {"до 100 кв.м": 5000, "100-200 кв.м": 5500, "200-300 кв.м": 6000, "свыше 300 кв.м": 6500}
-
-    base_price = areas.get(area, 3000)
-
-    # Выезд = 0 если объект в городе
-    travel_cost = 0 if in_city else round(distance_km * 35, 2)
-
-    return base_price, travel_cost, base_price + travel_cost
+def calculate_insurance_cost(obj_code, balance):
+    """Расчёт стоимости страхования"""
+    rate = 0.001 if obj_code == 'flat' else 0.003
+    return round(balance * rate, 2)
 
 
-async def format_admin_message(user_data: dict) -> str:
-    service = user_data.get('service')
+# ========== ФОРМИРОВАНИЕ ЗАЯВКИ ==========
 
-    if service == 'service_1':
-        bank = user_data.get('bank')
-        mortgage_purpose = user_data.get('mortgage_purpose')
-        purpose_name = user_data.get('purpose_name')
-        report_type = user_data.get('report_type')
+async def format_order_text(data: dict) -> str:
+    service = data.get('service_type', '')
 
-        msg = "💎 <b>Оценка недвижимости</b>\n\n"
+    if service == 'evaluation':
+        bank = data.get('bank_name', '')
+        purpose = data.get('purpose_name', '')
+        mpurpose = data.get('mpurpose_name', '')
 
+        text = "💎 <b>ОЦЕНКА НЕДВИЖИМОСТИ</b>\n\n"
         if bank:
-            msg += f"Банк: {bank}\n"
-            msg += f"Цель: {mortgage_purpose}\n"
-        elif purpose_name:
-            msg += f"Цель: {purpose_name}\n"
-            msg += f"Форма: {report_type}\n"
+            text += f"🏦 Банк: {bank}\n"
+            text += f"🎯 Цель: {mpurpose}\n"
+        else:
+            text += f"🎯 Цель: {purpose}\n"
+            text += f"📄 Форма: {data.get('report_name', '')}\n"
 
-        msg += f"Объект: {user_data.get('object_type')}\n"
-        msg += f"Адрес: {user_data.get('address')}\n"
+        text += f"🏠 Объект: {data.get('object_name', '')}\n"
+        text += f"📍 Адрес: {data.get('address', '')}\n"
+        if data.get('full_address'):
+            text += f"📌 Определён: {data.get('full_address')}\n"
+        text += f"📏 Расстояние: {data.get('distance', 0)} км\n"
+        text += f"📅 Дата: {data.get('date', '')}\n"
+        text += f"💰 Стоимость: {data.get('cost', 0)} ₽"
 
-        if user_data.get('full_address'):
-            msg += f"Распознанный адрес: {user_data.get('full_address')}\n"
+    elif service == 'flood':
+        text = "💧 <b>ОЦЕНКА УЩЕРБА ОТ ЗАТОПЛЕНИЯ</b>\n\n"
+        text += f"🏠 Объект: {data.get('object_name', '')}\n"
+        text += f"🚪 Помещений: {data.get('rooms', 1)}\n"
+        text += f"📍 Адрес: {data.get('address', '')}\n"
+        text += f"📏 Расстояние: {data.get('distance', 0)} км\n"
+        text += f"📅 Дата: {data.get('date', '')}\n"
+        text += f"💰 Стоимость: {data.get('cost', 0)} ₽"
 
-        msg += f"Расстояние: {user_data.get('distance_km', 0)} км\n"
-        msg += f"Дата осмотра: {user_data.get('date')}\n"
-        msg += f"Стоимость: {user_data.get('cost')} ₽"
+    elif service == 'bti':
+        text = "📋 <b>БТИ / КАДАСТР / МЕЖЕВАНИЕ</b>\n\n"
+        text += f"📄 Услуга: {data.get('bti_service_name', '')}\n"
+        if data.get('bti_object_name'):
+            text += f"🏠 Объект: {data.get('bti_object_name')}\n"
+        if data.get('survey_service_name'):
+            text += f"📐 Вид работ: {data.get('survey_service_name')}\n"
+        if data.get('acts_service_name'):
+            text += f"📑 Услуга: {data.get('acts_service_name')}\n"
+        text += f"📍 Адрес: {data.get('address', '')}\n"
+        if data.get('cost'):
+            text += f"💰 Стоимость: {data.get('cost')} ₽"
 
-    elif service == 'service_2':
-        msg = "💧 <b>Оценка ущерба после затопления</b>\n\n"
-        msg += f"Объект: {user_data.get('object_type')}\n"
-        msg += f"Пострадало помещений: {user_data.get('rooms_count')}\n"
-        msg += f"Адрес: {user_data.get('address')}\n"
+    elif service == 'expertise':
+        text = "🔍 <b>ЭКСПЕРТИЗА / ОБСЛЕДОВАНИЕ</b>\n\n"
+        text += f"📋 Тип: {data.get('exp_type_name', '')}\n"
+        if data.get('exp_stage_name'):
+            text += f"⚖ Этап: {data.get('exp_stage_name')}\n"
+        if data.get('exp_object_name'):
+            text += f"🏠 Объект: {data.get('exp_object_name')}\n"
+        if data.get('exp_status_name'):
+            text += f"🔧 Статус: {data.get('exp_status_name')}\n"
+        if data.get('exp_goals'):
+            text += f"🎯 Цели: {', '.join(data.get('exp_goals', []))}\n"
+        if data.get('exp_description'):
+            text += f"📝 Описание: {data.get('exp_description')}\n"
+        if data.get('acc_finish_name'):
+            text += f"🎨 Отделка: {data.get('acc_finish_name')}\n"
+        if data.get('acc_material_name'):
+            text += f"🧱 Материал: {data.get('acc_material_name')}\n"
+        if data.get('acc_area_name'):
+            text += f"📏 Площадь: {data.get('acc_area_name')}\n"
+        if data.get('insp_area_name'):
+            text += f"📏 Площадь: {data.get('insp_area_name')}\n"
+        if data.get('insp_material_name'):
+            text += f"🧱 Материал: {data.get('insp_material_name')}\n"
+        if data.get('insp_finish_name'):
+            text += f"🎨 Отделка: {data.get('insp_finish_name')}\n"
+        if data.get('therm_object_name'):
+            text += f"🏠 Объект: {data.get('therm_object_name')}\n"
+        if data.get('therm_area_name'):
+            text += f"📏 Площадь: {data.get('therm_area_name')}\n"
+        if data.get('address'):
+            text += f"📍 Адрес: {data.get('address')}\n"
+        if data.get('date'):
+            text += f"📅 Дата: {data.get('date')}\n"
+        if data.get('cost'):
+            text += f"💰 Стоимость: {data.get('cost')} ₽"
 
-        if user_data.get('full_address'):
-            msg += f"Распознанный адрес: {user_data.get('full_address')}\n"
-
-        msg += f"Расстояние: {user_data.get('distance_km', 0)} км\n"
-        msg += f"Дата осмотра: {user_data.get('date')}\n"
-        msg += f"Стоимость: {user_data.get('cost')} ₽"
-
-    elif service == 'service_5':
-        msg = "🛡️ <b>Ипотечное страхование</b>\n\n"
-        insurance_type = "Новая ипотека" if user_data.get('insurance_type') == 'new' else "Продление договора"
-        msg += f"Тип: {insurance_type}\n"
-        msg += f"Страхование: {user_data.get('insurance_coverage_name')}\n"
-        msg += f"Объект: {user_data.get('insurance_object')}\n"
-        msg += f"Остаток по ипотеке: {user_data.get('mortgage_balance')} ₽\n"
-        msg += f"Предварительная стоимость: {user_data.get('insurance_cost')} ₽"
+    elif service == 'insurance':
+        text = "🛡 <b>ИПОТЕЧНОЕ СТРАХОВАНИЕ</b>\n\n"
+        text += f"📋 Тип: {data.get('ins_type_name', '')}\n"
+        text += f"🛡 Покрытие: {data.get('ins_coverage_name', '')}\n"
+        text += f"🏠 Объект: {data.get('ins_object_name', '')}\n"
+        text += f"💳 Остаток: {data.get('balance', 0):,.0f} ₽\n".replace(',', ' ')
+        text += f"💰 Примерная стоимость: {data.get('cost', 0)} ₽"
+        if data.get('life_info'):
+            text += f"\n\n❤ <b>Информация для страхования жизни:</b>\n{data.get('life_info')}"
 
     else:
-        msg = f"Новая заявка\n\nСервис: {service}"
+        text = "📋 <b>ЗАЯВКА</b>\n\n"
+        for k, v in data.items():
+            if v and not k.startswith('_') and k != 'documents':
+                text += f"{k}: {v}\n"
 
-    return msg
+    return text
 
+
+# ========== ОБРАБОТЧИКИ ==========
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     await state.set_state(Form.waiting_for_service)
-
-    welcome_text = (
-        "🏢 <b>Добро пожаловать!</b>\n"
-        "━━━━━━━━━━━━━━\n\n"
-        "Вас приветствует компания <b><i>НЭК Перспектива</i></b>\n\n"
-        "💼 Профессиональные услуги:\n"
+    text = (
+        "🏢 <b>НЭК Перспектива</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Профессиональные услуги:\n"
         "• Оценка недвижимости\n"
-        "• БТИ и кадастровые работы\n"
-        "• Строительные экспертизы\n"
-        "• Ипотечное страхование\n"
-        "• Сделки с недвижимостью\n\n"
-        "━━━━━━━━━━━━━━\n"
+        "• БТИ и кадастр\n"
+        "• Строительная экспертиза\n"
+        "• Ипотечное страхование\n\n"
         "👇 Выберите услугу:"
     )
-
-    await message.answer(welcome_text, reply_markup=get_main_menu(), parse_mode="HTML")
+    await message.answer(text, reply_markup=get_main_menu(), parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "main_menu")
-async def cmd_main_menu(callback: CallbackQuery, state: FSMContext):
+async def go_main_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await state.set_state(Form.waiting_for_service)
-
-    welcome_text = (
-        "🏢 <b>Главное меню</b>\n"
-        "━━━━━━━━━━━━━━\n\n"
-        "👇 Выберите услугу:"
+    await callback.message.edit_text(
+        "🏢 <b>Главное меню</b>\n━━━━━━━━━━━━━━━━━━━━\n\n👇 Выберите услугу:",
+        reply_markup=get_main_menu(), parse_mode="HTML"
     )
-
-    await callback.message.edit_text(welcome_text, reply_markup=get_main_menu(), parse_mode="HTML")
     await callback.answer()
 
 
 @dp.callback_query(F.data == "back")
-async def process_back(callback: CallbackQuery, state: FSMContext):
-    current_state = await state.get_state()
-    user_data = await state.get_data()
-
-    # Навигация назад в зависимости от текущего состояния
-    if current_state == Form.waiting_for_bti_service:
-        await state.set_state(Form.waiting_for_service)
-        await callback.message.edit_text(
-            "🏢 <b>Главное меню</b>\n━━━━━━━━━━━━━━\n\n👇 Выберите услугу:",
-            reply_markup=get_main_menu(),
-            parse_mode="HTML"
-        )
-    elif current_state == Form.waiting_for_bti_object_type:
-        await state.set_state(Form.waiting_for_bti_service)
-        await callback.message.edit_text(
-            "📋 <b>БТИ / Кадастр / Межевание</b>\n\nВыберите услугу:",
-            reply_markup=get_bti_services_menu(),
-            parse_mode="HTML"
-        )
-    elif current_state == Form.waiting_for_bti_surveying_service:
-        await state.set_state(Form.waiting_for_bti_service)
-        await callback.message.edit_text(
-            "📋 <b>БТИ / Кадастр / Межевание</b>\n\nВыберите услугу:",
-            reply_markup=get_bti_services_menu(),
-            parse_mode="HTML"
-        )
-    elif current_state == Form.waiting_for_bti_acts_service:
-        await state.set_state(Form.waiting_for_bti_service)
-        await callback.message.edit_text(
-            "📋 <b>БТИ / Кадастр / Межевание</b>\n\nВыберите услугу:",
-            reply_markup=get_bti_services_menu(),
-            parse_mode="HTML"
-        )
-    elif current_state == Form.waiting_for_expertise_type:
-        await state.set_state(Form.waiting_for_service)
-        await callback.message.edit_text(
-            "🏢 <b>Главное меню</b>\n━━━━━━━━━━━━━━\n\n👇 Выберите услугу:",
-            reply_markup=get_main_menu(),
-            parse_mode="HTML"
-        )
-    elif current_state == Form.waiting_for_expertise_stage:
-        await state.set_state(Form.waiting_for_expertise_type)
-        await callback.message.edit_text(
-            "🔨 <b>Строительно-техническая экспертиза / Обследования</b>\n\nВыберите тип:",
-            reply_markup=get_expertise_menu(),
-            parse_mode="HTML"
-        )
-    elif current_state == Form.waiting_for_insurance_type:
-        await state.set_state(Form.waiting_for_service)
-        await callback.message.edit_text(
-            "🏢 <b>Главное меню</b>\n━━━━━━━━━━━━━━\n\n👇 Выберите услугу:",
-            reply_markup=get_main_menu(),
-            parse_mode="HTML"
-        )
-    elif current_state == Form.waiting_for_insurance_coverage:
-        await state.set_state(Form.waiting_for_insurance_type)
-        await callback.message.edit_text(
-            "🛡️ <b>Ипотечное страхование</b>\n\nВыберите тип:",
-            reply_markup=get_insurance_type_menu(),
-            parse_mode="HTML"
-        )
-    elif current_state == Form.waiting_for_insurance_object:
-        await state.set_state(Form.waiting_for_insurance_coverage)
-        await callback.message.edit_text(
-            "🛡️ <b>Что страхуем?</b>",
-            reply_markup=get_insurance_coverage_menu(),
-            parse_mode="HTML"
-        )
-    elif current_state == Form.waiting_for_deals_service:
-        await state.set_state(Form.waiting_for_service)
-        await callback.message.edit_text(
-            "🏢 <b>Главное меню</b>\n━━━━━━━━━━━━━━\n\n👇 Выберите услугу:",
-            reply_markup=get_main_menu(),
-            parse_mode="HTML"
-        )
-    elif current_state == Form.waiting_for_purpose:
-        await state.set_state(Form.waiting_for_service)
-        await callback.message.edit_text(
-            "🏢 <b>Главное меню</b>\n━━━━━━━━━━━━━━\n\n👇 Выберите услугу:",
-            reply_markup=get_main_menu(),
-            parse_mode="HTML"
-        )
-    elif current_state == Form.waiting_for_bank:
-        await state.set_state(Form.waiting_for_purpose)
-        await callback.message.edit_text(
-            "💎 <b>Оценка недвижимости</b>\n\nВыберите цель:",
-            reply_markup=get_evaluation_purpose_menu(),
-            parse_mode="HTML"
-        )
-    elif current_state == Form.waiting_for_mortgage_purpose:
-        await state.set_state(Form.waiting_for_bank)
-        await callback.message.edit_text(
-            "🏦 <b>Оценка для банка</b>\n\nВыберите банк:",
-            reply_markup=get_banks_menu(),
-            parse_mode="HTML"
-        )
-    elif current_state == Form.waiting_for_report_type:
-        await state.set_state(Form.waiting_for_purpose)
-        await callback.message.edit_text(
-            "💎 <b>Оценка недвижимости</b>\n\nВыберите цель:",
-            reply_markup=get_evaluation_purpose_menu(),
-            parse_mode="HTML"
-        )
-    elif current_state == Form.waiting_for_object_type:
-        service = user_data.get('service')
-        if service == 'service_1' and user_data.get('bank'):
-            await state.set_state(Form.waiting_for_mortgage_purpose)
-            await callback.message.edit_text(
-                f"🏦 Банк: {user_data.get('bank')}\n\nВыберите цель:",
-                reply_markup=get_mortgage_purpose_menu(),
-                parse_mode="HTML"
-            )
-        elif service == 'service_1' and user_data.get('report_type'):
-            await state.set_state(Form.waiting_for_report_type)
-            await callback.message.edit_text(
-                f"📊 {user_data.get('purpose_name')}\n\nФорма оценки:",
-                reply_markup=get_report_type_menu(),
-                parse_mode="HTML"
-            )
-        elif service == 'service_2':
-            await state.set_state(Form.waiting_for_service)
-            await callback.message.edit_text(
-                "🏢 <b>Главное меню</b>\n━━━━━━━━━━━━━━\n\n👇 Выберите услугу:",
-                reply_markup=get_main_menu(),
-                parse_mode="HTML"
-            )
-        else:
-            await state.set_state(Form.waiting_for_purpose)
-            await callback.message.edit_text(
-                "💎 <b>Оценка недвижимости</b>\n\nВыберите цель:",
-                reply_markup=get_evaluation_purpose_menu(),
-                parse_mode="HTML"
-            )
-    elif current_state == Form.waiting_for_flood_rooms:
-        await state.set_state(Form.waiting_for_object_type)
-        await callback.message.edit_text(
-            "🏠 <b>Какой объект пострадал?</b>",
-            reply_markup=get_flood_object_types(),
-            parse_mode="HTML"
-        )
-    elif current_state == Form.waiting_for_address:
-        service = user_data.get('service')
-        bti_service = user_data.get('bti_service')
-
-        if service == 'service_2':
-            await state.set_state(Form.waiting_for_flood_rooms)
-            await callback.message.edit_text(
-                "🔢 <b>Количество пострадавших помещений</b>\n\nВведите число:",
-                reply_markup=get_back_button(),
-                parse_mode="HTML"
-            )
-        elif bti_service in ["2", "5"]:
-            await state.set_state(Form.waiting_for_bti_object_type)
-            await callback.message.edit_text(
-                "🏠 <b>Выберите тип объекта:</b>",
-                reply_markup=get_bti_object_types_menu(),
-                parse_mode="HTML"
-            )
-        elif bti_service:
-            await state.set_state(Form.waiting_for_bti_service)
-            await callback.message.edit_text(
-                "📋 <b>БТИ / Кадастр / Межевание</b>\n\nВыберите услугу:",
-                reply_markup=get_bti_services_menu(),
-                parse_mode="HTML"
-            )
-        else:
-            await state.set_state(Form.waiting_for_object_type)
-            await callback.message.edit_text(
-                "🏠 <b>Выберите тип объекта:</b>",
-                reply_markup=get_object_types_menu(),
-                parse_mode="HTML"
-            )
-    else:
-        await state.set_state(Form.waiting_for_service)
-        await callback.message.edit_text(
-            "🏢 <b>Главное меню</b>\n━━━━━━━━━━━━━━\n\n👇 Выберите услугу:",
-            reply_markup=get_main_menu(),
-            parse_mode="HTML"
-        )
-
+async def go_back(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(Form.waiting_for_service)
+    await callback.message.edit_text(
+        "🏢 <b>Главное меню</b>\n━━━━━━━━━━━━━━━━━━━━\n\n👇 Выберите услугу:",
+        reply_markup=get_main_menu(), parse_mode="HTML"
+    )
     await callback.answer()
 
+
+# === ВЫБОР УСЛУГИ ===
 
 @dp.callback_query(F.data.startswith("service_"))
-async def process_service(callback: CallbackQuery, state: FSMContext):
-    service_id = callback.data
-    await state.update_data(service=service_id)
+async def select_service(callback: CallbackQuery, state: FSMContext):
+    srv = callback.data.split("_")[1]
 
-    if service_id == "service_1":
+    if srv == "1":  # Оценка
+        await state.update_data(service_type='evaluation')
         await state.set_state(Form.waiting_for_purpose)
-        text = "💎 <b>Оценка недвижимости</b>\n━━━━━━━━━━━━━━\n\n👇 Выберите цель:"
-        await callback.message.edit_text(text, reply_markup=get_evaluation_purpose_menu(), parse_mode="HTML")
+        await callback.message.edit_text(
+            "💎 <b>Оценка недвижимости</b>\n\n👇 Выберите цель оценки:",
+            reply_markup=get_evaluation_purpose_menu(), parse_mode="HTML"
+        )
 
-    elif service_id == "service_2":
+    elif srv == "2":  # Затопление
+        await state.update_data(service_type='flood')
         await state.set_state(Form.waiting_for_object_type)
-        text = "💧 <b>Оценка ущерба после затопления</b>\n━━━━━━━━━━━━━━\n\n🏠 Какой объект пострадал?"
-        await callback.message.edit_text(text, reply_markup=get_flood_object_types(), parse_mode="HTML")
+        await callback.message.edit_text(
+            "💧 <b>Оценка ущерба после затопления</b>\n\n🏠 Какой объект пострадал?",
+            reply_markup=get_flood_objects_menu(), parse_mode="HTML"
+        )
 
-    elif service_id == "service_3":
+    elif srv == "3":  # БТИ
+        await state.update_data(service_type='bti')
         await state.set_state(Form.waiting_for_bti_service)
-        text = "📋 <b>БТИ / Кадастр / Межевание</b>\n━━━━━━━━━━━━━━\n\n👇 Выберите услугу:"
-        await callback.message.edit_text(text, reply_markup=get_bti_services_menu(), parse_mode="HTML")
+        await callback.message.edit_text(
+            "📋 <b>БТИ / Кадастр / Межевание</b>\n\n👇 Выберите услугу:",
+            reply_markup=get_bti_menu(), parse_mode="HTML"
+        )
 
-    elif service_id == "service_4":
+    elif srv == "4":  # Экспертиза
+        await state.update_data(service_type='expertise')
         await state.set_state(Form.waiting_for_expertise_type)
-        text = "🔨 <b>Строительно-техническая экспертиза / Обследования</b>\n━━━━━━━━━━━━━━\n\n👇 Выберите тип:"
-        await callback.message.edit_text(text, reply_markup=get_expertise_menu(), parse_mode="HTML")
+        await callback.message.edit_text(
+            "🔨 <b>Экспертиза / Обследования</b>\n\n👇 Выберите тип услуги:",
+            reply_markup=get_expertise_menu(), parse_mode="HTML"
+        )
 
-    elif service_id == "service_5":
+    elif srv == "5":  # Страхование
+        await state.update_data(service_type='insurance')
         await state.set_state(Form.waiting_for_insurance_type)
-        text = "🛡️ <b>Ипотечное страхование</b>\n━━━━━━━━━━━━━━\n\n👇 Выберите тип:"
-        await callback.message.edit_text(text, reply_markup=get_insurance_type_menu(), parse_mode="HTML")
+        await callback.message.edit_text(
+            "🛡 <b>Ипотечное страхование</b>\n\n👇 Выберите тип:",
+            reply_markup=get_insurance_type_menu(), parse_mode="HTML"
+        )
 
-    elif service_id == "service_6":
+    elif srv == "6":  # Сделки
+        await state.update_data(service_type='deals')
         await state.set_state(Form.waiting_for_deals_service)
-        text = "🏢 <b>Сделки с недвижимостью</b>\n━━━━━━━━━━━━━━\n\n👇 Выберите услугу:"
-        await callback.message.edit_text(text, reply_markup=get_deals_menu(), parse_mode="HTML")
-
-    await callback.answer()
-
-
-# БТИ HANDLERS
-@dp.callback_query(F.data.startswith("bti_"))
-async def process_bti_service(callback: CallbackQuery, state: FSMContext):
-    bti_id = callback.data.split("_")[1]
-    bti_services = {
-        "1": "Выписка из технического паспорта",
-        "2": "Технический паспорт",
-        "3": "Технический план",
-        "4": "Межевание (земля)",
-        "5": "Акты, справки"
-    }
-    bti_service_name = bti_services.get(bti_id)
-    await state.update_data(bti_service=bti_id, bti_service_name=bti_service_name)
-
-    if bti_id == "1":
-        await state.set_state(Form.waiting_for_address)
-        text = (
-            f"📄 <b>{bti_service_name}</b>\n━━━━━━━━━━━━━━\n\n"
-            "📍 Введите адрес:\n"
-            "Город, улица, дом, кв\n"
-            "или\nКадастровый номер"
+        await callback.message.edit_text(
+            "🏢 <b>Сделки с недвижимостью</b>\n\n👇 Выберите услугу:",
+            reply_markup=get_deals_menu(), parse_mode="HTML"
         )
-        await callback.message.edit_text(text, reply_markup=get_back_button(), parse_mode="HTML")
-
-    elif bti_id in ["2", "5"]:
-        if bti_id == "2":
-            await state.set_state(Form.waiting_for_bti_object_type)
-            text = f"📋 <b>{bti_service_name}</b>\n━━━━━━━━━━━━━━\n\n"
-
-            try:
-                photo_path = PRICE_PHOTOS['tech_passport']
-                if os.path.exists(photo_path):
-                    await callback.message.delete()
-                    photo = FSInputFile(photo_path)
-                    text += "💰 Прайс-лист\n\n👇 Выберите объект:"
-                    sent = await callback.message.answer_photo(
-                        photo=photo,
-                        caption=text,
-                        reply_markup=get_tech_passport_options(),
-                        parse_mode="HTML"
-                    )
-                    await callback.answer()
-                    return
-            except:
-                pass
-
-            text += "👇 Выберите объект:"
-            await callback.message.edit_text(text, reply_markup=get_tech_passport_options(), parse_mode="HTML")
-        else:
-            await state.set_state(Form.waiting_for_bti_object_type)
-            text = f"📑 <b>{bti_service_name}</b>\n━━━━━━━━━━━━━━\n\n"
-
-            try:
-                photo_path = PRICE_PHOTOS['acts']
-                if os.path.exists(photo_path):
-                    await callback.message.delete()
-                    photo = FSInputFile(photo_path)
-                    text += "💰 Прайс-лист\n\n👇 Выберите услугу:"
-                    await callback.message.answer_photo(
-                        photo=photo,
-                        caption=text,
-                        reply_markup=get_acts_options(),
-                        parse_mode="HTML"
-                    )
-                    await callback.answer()
-                    return
-            except:
-                pass
-
-            text += "👇 Выберите услугу:"
-            await callback.message.edit_text(text, reply_markup=get_acts_options(), parse_mode="HTML")
-
-    elif bti_id == "3":
-        text = "📐 <b>Технический план</b>\n━━━━━━━━━━━━━━\n\n"
-
-        try:
-            photo_path = PRICE_PHOTOS['tech_plan']
-            if os.path.exists(photo_path):
-                await callback.message.delete()
-                photo = FSInputFile(photo_path)
-                text += "💰 Прайс-лист\n\n👇 Выберите действие:"
-                await callback.message.answer_photo(
-                    photo=photo,
-                    caption=text,
-                    reply_markup=get_tech_plan_options(),
-                    parse_mode="HTML"
-                )
-                await callback.answer()
-                return
-        except:
-            pass
-
-        text += "👇 Выберите действие:"
-        await callback.message.edit_text(text, reply_markup=get_tech_plan_options(), parse_mode="HTML")
-
-    elif bti_id == "4":
-        text = "🗺️ <b>Межевание (земля)</b>\n━━━━━━━━━━━━━━\n\n"
-
-        try:
-            photo_path = PRICE_PHOTOS['surveying']
-            if os.path.exists(photo_path):
-                await callback.message.delete()
-                photo = FSInputFile(photo_path)
-                text += "💰 Прайс-лист\n\n👇 Выберите действие:"
-                await callback.message.answer_photo(
-                    photo=photo,
-                    caption=text,
-                    reply_markup=get_surveying_options(),
-                    parse_mode="HTML"
-                )
-                await callback.answer()
-                return
-        except:
-            pass
-
-        text += "👇 Выберите действие:"
-        await callback.message.edit_text(text, reply_markup=get_surveying_options(), parse_mode="HTML")
 
     await callback.answer()
 
 
-@dp.callback_query(F.data == "tech_plan_price")
-async def process_tech_plan_price(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(Form.waiting_for_object_type)
-    text = "📐 <b>Технический план</b>\n━━━━━━━━━━━━━━\n\n🏠 Выберите объект:"
-    await callback.message.edit_text(text, reply_markup=get_tech_plan_objects(), parse_mode="HTML")
-    await callback.answer()
+# ========== ОЦЕНКА НЕДВИЖИМОСТИ ==========
 
-
-@dp.callback_query(F.data.startswith("tech_plan_obj_"))
-async def process_tech_plan_object(callback: CallbackQuery, state: FSMContext):
-    obj_id = callback.data.split("_")[3]
-    objects = {
-        "1": "Квартира, комната",
-        "2": "Жилой дом/садовый дом/таунхаус",
-        "3": "Нежилое помещение",
-        "4": "Нежилое здание",
-        "5": "Гараж",
-        "6": "Раздел дома",
-        "7": "Раздел/объединение помещений"
-    }
-    obj_type = objects.get(obj_id)
-    await state.update_data(tech_plan_object=obj_type, is_tech_plan=True)
-    await state.set_state(Form.waiting_for_address)
-
-    text = f"📐 <b>Технический план</b>\n🏠 {obj_type}\n━━━━━━━━━━━━━━\n\n📍 Введите адрес или кадастровый номер:"
-    await callback.message.edit_text(text, reply_markup=get_back_button(), parse_mode="HTML")
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "surveying_price")
-async def process_surveying_price(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(Form.waiting_for_bti_surveying_service)
-    text = "🗺️ <b>Межевание (земля)</b>\n━━━━━━━━━━━━━━\n\n👇 Выберите услугу:"
-    await callback.message.edit_text(text, reply_markup=get_surveying_services(), parse_mode="HTML")
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("surv_serv_"))
-async def process_surveying_service(callback: CallbackQuery, state: FSMContext):
-    serv_id = callback.data.split("_")[2]
-    services = {
-        "1": "Уточнение границ зем. участка",
-        "2": "Раздел/объединение участка",
-        "3": "Схема для КУиЗО",
-        "4": "Перераспределение (межевой)",
-        "5": "Перераспределение (схема + межевой)",
-        "6": "Схема под гараж",
-        "7": "Межевой по распоряжению",
-        "8": "Межевой для суда",
-        "9": "Межевой на сервитут",
-        "other": "Другое"
-    }
-    service_name = services.get(serv_id, "Другое")
-    await state.update_data(surveying_service=service_name)
-    await state.set_state(Form.waiting_for_address)
-
-    text = f"🗺️ <b>Межевание</b>\n📋 {service_name}\n━━━━━━━━━━━━━━\n\n📍 Введите кадастровый номер:"
-    await callback.message.edit_text(text, reply_markup=get_back_button(), parse_mode="HTML")
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "acts_price")
-async def process_acts_price(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(Form.waiting_for_bti_acts_service)
-    text = "📑 <b>Акты, справки</b>\n━━━━━━━━━━━━━━\n\n👇 Выберите услугу:"
-    await callback.message.edit_text(text, reply_markup=get_acts_services(), parse_mode="HTML")
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("acts_serv_"))
-async def process_acts_service(callback: CallbackQuery, state: FSMContext):
-    serv_id = callback.data.split("_")[2]
-    services = {
-        "1": "Документы на акт ввода до 1500 кв.м",
-        "2": "На гараж",
-        "3": "Акт сноса",
-        "4": "Справка о местоположении (комната)",
-        "5": "Справка о стоимости",
-        "6": "Заполнение уведомлений",
-        "other": "Другое"
-    }
-    service_name = services.get(serv_id, "Другое")
-    await state.update_data(acts_service=service_name)
-
-    # Отправка администраторам
-    admin_text = f"📑 <b>Акты, справки</b>\n\nУслуга: {service_name}"
-    await send_to_admins(admin_text, get_user_info(callback.from_user))
-
-    text = (
-        f"📑 <b>Акты, справки</b>\n{service_name}\n━━━━━━━━━━━━━━\n\n"
-        "✅ <b>Заявка принята!</b>\n\n"
-        "📞 Специалист свяжется с вами в ближайшее время"
-    )
-    await callback.message.edit_text(text, reply_markup=get_main_menu_button(), parse_mode="HTML")
-    await state.clear()
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "tech_passport_price")
-async def process_tech_passport_price(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(Form.waiting_for_bti_object_type)
-    text = "📋 <b>Технический паспорт</b>\n━━━━━━━━━━━━━━\n\n🏠 Выберите объект:"
-    await callback.message.edit_text(text, reply_markup=get_bti_object_types_menu(), parse_mode="HTML")
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("bti_object_"))
-async def process_bti_object_type(callback: CallbackQuery, state: FSMContext):
-    object_type = callback.data.split("_")[2]
-    object_names = {
-        "flat": "Квартира",
-        "house": "Жилой дом",
-        "nonres": "Нежилое помещение",
-        "garage": "Гараж"
-    }
-    object_name = object_names.get(object_type)
-    await state.update_data(bti_object_type=object_type, bti_object_name=object_name)
-    await state.set_state(Form.waiting_for_address)
-
-    text = f"📋 <b>Технический паспорт</b>\n🏠 {object_name}\n━━━━━━━━━━━━━━\n\n📍 Введите адрес:"
-    await callback.message.edit_text(text, reply_markup=get_back_button(), parse_mode="HTML")
-    await callback.answer()
-
-
-# EXPERTISE HANDLERS
-@dp.callback_query(F.data.startswith("expertise_"))
-async def process_expertise(callback: CallbackQuery, state: FSMContext):
-    exp_id = callback.data.split("_")[1]
-
-    if exp_id == "1":
-        await state.update_data(expertise_type="Строительно-техническая экспертиза")
-        await state.set_state(Form.waiting_for_expertise_stage)
-        text = (
-            "🔍 <b>Строительно-техническая экспертиза</b>\n━━━━━━━━━━━━━━\n\n"
-            "Я помогу оформить заявку на строительно-техническую экспертизу.\n\n"
-            "На каком этапе сейчас находится ваш спор?"
-        )
-        await callback.message.edit_text(text, reply_markup=get_expertise_stage_menu(), parse_mode="HTML")
-
-    elif exp_id == "2":
-        await state.update_data(expertise_type="Приемка жилого дома от застройщика")
-        await state.set_state(Form.waiting_for_acceptance_state)
-        text = (
-            "🏡 <b>Приемка жилого дома от застройщика</b>\n━━━━━━━━━━━━━━\n\n"
-            "Я помогу оформить заявку на приёмку жилого дома.\n\n"
-            "Состояние внутренней отделки:"
-        )
-        await callback.message.edit_text(text, reply_markup=get_acceptance_state_menu(), parse_mode="HTML")
-
-    elif exp_id == "3":
-        await state.update_data(expertise_type="Техническое обследование перед покупкой")
-        await state.set_state(Form.waiting_for_inspection_area)
-        text = (
-            "🏠 <b>Техническое обследование перед покупкой</b>\n━━━━━━━━━━━━━━\n\n"
-            "✔️ Инструментальное обследование\n"
-            "✔️ Выявление скрытых дефектов\n"
-            "✔️ Оценка состояния дома\n"
-            "✔️ Консультация и рекомендации\n\n"
-            "Укажите площадь дома:"
-        )
-        await callback.message.edit_text(text, reply_markup=get_inspection_area_menu(), parse_mode="HTML")
-
-    elif exp_id == "4":
-        await state.update_data(expertise_type="Тепловизионное обследование")
-        await state.set_state(Form.waiting_for_thermal_object)
-        text = (
-            "🌡️ <b>Тепловизионное обследование</b>\n━━━━━━━━━━━━━━\n\n"
-            "Выберите объект:"
-        )
-        await callback.message.edit_text(text, reply_markup=get_thermal_object_menu(), parse_mode="HTML")
-
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("exp_stage_"))
-async def process_expertise_stage(callback: CallbackQuery, state: FSMContext):
-    stage_id = callback.data.split("_")[2]
-    stages = {
-        "1": "Идёт судебный процесс",
-        "2": "Досудебное урегулирование",
-        "3": "Затрудняюсь ответить"
-    }
-    await state.update_data(expertise_stage=stages.get(stage_id))
-    await state.set_state(Form.waiting_for_expertise_object)
-
-    text = "🏠 Какой объект требуется обследовать?"
-    await callback.message.edit_text(text, reply_markup=get_expertise_object_menu(), parse_mode="HTML")
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("exp_obj_"))
-async def process_expertise_object(callback: CallbackQuery, state: FSMContext):
-    obj_id = callback.data.split("_")[2]
-    objects = {
-        "1": "Квартира",
-        "2": "Жилой дом / коттедж",
-        "3": "Коммерческий объект",
-        "4": "Кровля",
-        "5": "Фундамент"
-    }
-    await state.update_data(expertise_object=objects.get(obj_id, "Другое"))
-    await state.set_state(Form.waiting_for_expertise_status)
-
-    text = "🏗️ Объект построен или в процессе?"
-    await callback.message.edit_text(text, reply_markup=get_expertise_status_menu(), parse_mode="HTML")
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("exp_status_"))
-async def process_expertise_status(callback: CallbackQuery, state: FSMContext):
-    status_id = callback.data.split("_")[2]
-    statuses = {
-        "1": "Построен",
-        "2": "В процессе строительства",
-        "3": "После ремонта / реконструкции"
-    }
-    await state.update_data(expertise_status=statuses.get(status_id))
-    await state.set_state(Form.waiting_for_expertise_description)
-
-    text = (
-        "📝 Опишите коротко проблемы или что вызывает сомнения\n\n"
-        "(трещины, протечки, неровная кладка и т.д.)"
-    )
-    await callback.message.edit_text(text, reply_markup=get_back_button(), parse_mode="HTML")
-    await callback.answer()
-
-
-@dp.message(Form.waiting_for_expertise_description)
-async def process_expertise_description(message: Message, state: FSMContext):
-    await state.update_data(expertise_description=message.text)
-    await state.set_state(Form.waiting_for_expertise_photos)
-
-    text = (
-        "📸 Прикрепите фото проблемных мест\n"
-        "(это поможет эксперту предварительно оценить ситуацию)\n\n"
-        "или нажмите /done для завершения"
-    )
-    await message.answer(text, parse_mode="HTML")
-
-
-@dp.message(Form.waiting_for_expertise_photos, F.photo)
-async def process_expertise_photos(message: Message, state: FSMContext):
-    await message.answer("✅ Фото получено")
-
-
-@dp.message(Command("done"), Form.waiting_for_expertise_photos)
-async def finish_expertise(message: Message, state: FSMContext):
-    user_data = await state.get_data()
-
-    admin_text = (
-        f"🔍 <b>{user_data.get('expertise_type')}</b>\n\n"
-        f"Этап: {user_data.get('expertise_stage')}\n"
-        f"Объект: {user_data.get('expertise_object')}\n"
-        f"Статус: {user_data.get('expertise_status')}\n"
-        f"Описание: {user_data.get('expertise_description')}"
-    )
-    await send_to_admins(admin_text, get_user_info(message.from_user))
-
-    text = "✅ <b>Заявка принята!</b>\n\n📞 Специалист свяжется с вами в ближайшее время"
-    await message.answer(text, reply_markup=get_main_menu_button(), parse_mode="HTML")
-    await state.clear()
-
-
-# ACCEPTANCE HANDLERS
-@dp.callback_query(F.data.startswith("acc_state_"))
-async def process_acceptance_state(callback: CallbackQuery, state: FSMContext):
-    state_id = callback.data.split("_")[2]
-    states = {
-        "1": "Черновая",
-        "2": "Предчистовая",
-        "3": "Чистовая"
-    }
-    await state.update_data(acceptance_state=states.get(state_id))
-    await state.set_state(Form.waiting_for_acceptance_material)
-
-    text = "🧱 Материал стен?"
-    await callback.message.edit_text(text, reply_markup=get_acceptance_material_menu(), parse_mode="HTML")
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("acc_mat_"))
-async def process_acceptance_material(callback: CallbackQuery, state: FSMContext):
-    mat_id = callback.data.split("_")[2]
-    materials = {
-        "1": "Кирпич",
-        "2": "Ж/б панели",
-        "3": "Блочный",
-        "4": "Дерево",
-        "other": "Другой"
-    }
-    await state.update_data(acceptance_material=materials.get(mat_id, "Другой"))
-    await state.set_state(Form.waiting_for_acceptance_area)
-
-    text = "📏 Площадь объекта?"
-    await callback.message.edit_text(text, reply_markup=get_acceptance_area_menu(), parse_mode="HTML")
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("acc_area_"))
-async def process_acceptance_area(callback: CallbackQuery, state: FSMContext):
-    area_id = callback.data.split("_")[2]
-    areas = {
-        "1": "до 150 кв.м",
-        "2": "150-250 кв.м",
-        "3": "250-500 кв.м"
-    }
-    area = areas.get(area_id)
-    await state.update_data(acceptance_area=area)
-    await state.set_state(Form.waiting_for_address)
-
-    text = "📍 Введите адрес объекта:"
-    await callback.message.edit_text(text, reply_markup=get_back_button(), parse_mode="HTML")
-    await callback.answer()
-
-
-# INSPECTION HANDLERS
-@dp.callback_query(F.data.startswith("insp_area_"))
-async def process_inspection_area(callback: CallbackQuery, state: FSMContext):
-    area_id = callback.data.split("_")[2]
-    areas = {
-        "1": "до 150 кв.м",
-        "2": "150-250 кв.м",
-        "3": "250-350 кв.м",
-        "4": "свыше 350 кв.м"
-    }
-    area = areas.get(area_id)
-    await state.update_data(inspection_area=area)
-    await state.set_state(Form.waiting_for_inspection_material)
-
-    text = "🧱 Материал стен дома?"
-    await callback.message.edit_text(text, reply_markup=get_inspection_material_menu(), parse_mode="HTML")
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("insp_mat_"))
-async def process_inspection_material(callback: CallbackQuery, state: FSMContext):
-    mat_id = callback.data.split("_")[2]
-    materials = {
-        "1": "Кирпич",
-        "2": "Ж/б панели",
-        "3": "Блочный",
-        "4": "Дерево",
-        "other": "Другой"
-    }
-    await state.update_data(inspection_material=materials.get(mat_id, "Другой"))
-    await state.set_state(Form.waiting_for_inspection_finish)
-
-    text = "🎨 Состояние внутренней отделки?"
-    await callback.message.edit_text(text, reply_markup=get_inspection_finish_menu(), parse_mode="HTML")
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("insp_fin_"))
-async def process_inspection_finish(callback: CallbackQuery, state: FSMContext):
-    fin_id = callback.data.split("_")[2]
-    finishes = {
-        "1": "Черновая",
-        "2": "Предчистовая",
-        "3": "Чистовая"
-    }
-    await state.update_data(inspection_finish=finishes.get(fin_id))
-    await state.set_state(Form.waiting_for_address)
-
-    text = "📍 Введите адрес объекта:"
-    await callback.message.edit_text(text, reply_markup=get_back_button(), parse_mode="HTML")
-    await callback.answer()
-
-
-# THERMAL HANDLERS
-@dp.callback_query(F.data.startswith("therm_obj_"))
-async def process_thermal_object(callback: CallbackQuery, state: FSMContext):
-    obj_id = callback.data.split("_")[2]
-    objects = {
-        "1": "Квартира",
-        "2": "Жилой дом"
-    }
-    await state.update_data(thermal_object=objects.get(obj_id))
-    await state.set_state(Form.waiting_for_thermal_area)
-
-    text = "📏 Площадь объекта?"
-    await callback.message.edit_text(text, reply_markup=get_thermal_area_menu(), parse_mode="HTML")
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("therm_area_"))
-async def process_thermal_area(callback: CallbackQuery, state: FSMContext):
-    area_id = callback.data.split("_")[2]
-    areas = {
-        "1": "до 100 кв.м",
-        "2": "100-200 кв.м",
-        "3": "200-300 кв.м",
-        "4": "свыше 300 кв.м"
-    }
-    area = areas.get(area_id)
-    await state.update_data(thermal_area=area)
-    await state.set_state(Form.waiting_for_address)
-
-    text = "📍 Введите адрес объекта:"
-    await callback.message.edit_text(text, reply_markup=get_back_button(), parse_mode="HTML")
-    await callback.answer()
-
-
-# EVALUATION HANDLERS
 @dp.callback_query(F.data.startswith("purpose_"))
-async def process_evaluation_purpose(callback: CallbackQuery, state: FSMContext):
-    purpose_id = callback.data.split("_")[1]
+async def select_purpose(callback: CallbackQuery, state: FSMContext):
+    purpose = callback.data.split("_")[1]
+    purposes = {
+        'bank': 'Для банка (ипотека)', 'opeka': 'Для органов опеки',
+        'notary': 'Для нотариуса', 'court': 'Для суда',
+        'sale': 'Для купли-продажи', 'other': 'Иная цель'
+    }
 
-    if purpose_id == "1.1":
+    await state.update_data(purpose_code=purpose, purpose_name=purposes.get(purpose, ''))
+
+    if purpose == 'bank':
         await state.set_state(Form.waiting_for_bank)
         await callback.message.edit_text(
-            "🏦 <b>Оценка для банка</b>\n━━━━━━━━━━━━━━\n\nВыберите банк:",
-            reply_markup=get_banks_menu(),
-            parse_mode="HTML"
+            "🏦 <b>Оценка для банка</b>\n\n👇 В какой банк будет предоставляться оценка?",
+            reply_markup=get_banks_menu(), parse_mode="HTML"
         )
     else:
-        purpose_names = {
-            "1.2": "Для органов опеки",
-            "1.3": "Для нотариуса",
-            "1.4": "Для суда",
-            "1.5": "Для купли-продажи",
-            "1.6": "Иная цель"
-        }
-        purpose_name = purpose_names.get(purpose_id)
-        await state.update_data(purpose=purpose_id, purpose_name=purpose_name)
         await state.set_state(Form.waiting_for_report_type)
         await callback.message.edit_text(
-            f"📊 <b>{purpose_name}</b>\n━━━━━━━━━━━━━━\n\nФорма оценки:",
-            reply_markup=get_report_type_menu(),
-            parse_mode="HTML"
+            f"📊 <b>{purposes.get(purpose)}</b>\n\n👇 В какой форме требуется оценка?",
+            reply_markup=get_report_type_menu(), parse_mode="HTML"
         )
+
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("bank_"))
-async def process_bank(callback: CallbackQuery, state: FSMContext):
-    bank_name = callback.data.split("_", 1)[1]
-    await state.update_data(bank=bank_name)
+async def select_bank(callback: CallbackQuery, state: FSMContext):
+    bank = callback.data.split("_")[1]
+    await state.update_data(bank_code=bank, bank_name=BANK_NAMES.get(bank, 'Другой'))
     await state.set_state(Form.waiting_for_mortgage_purpose)
-    text = f"🏦 Банк: {bank_name}\n━━━━━━━━━━━━━━\n\n👇 Выберите цель:"
-    await callback.message.edit_text(text, reply_markup=get_mortgage_purpose_menu(), parse_mode="HTML")
+    await callback.message.edit_text(
+        f"🏦 Банк: {BANK_NAMES.get(bank)}\n\n👇 Цель оценки:",
+        reply_markup=get_mortgage_purpose_menu(), parse_mode="HTML"
+    )
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("mortgage_"))
-async def process_mortgage_purpose(callback: CallbackQuery, state: FSMContext):
-    purpose_id = callback.data.split("_")[1]
-    purpose_names = {
-        "1": "Оформление ипотеки",
-        "2": "Оформление закладной",
-        "3": "Рефинансирование"
+@dp.callback_query(F.data.startswith("mpurpose_"))
+async def select_mortgage_purpose(callback: CallbackQuery, state: FSMContext):
+    mp = callback.data.split("_")[1]
+    names = {
+        'new': 'Оформление ипотеки',
+        'zaklad': 'Оформление закладной',
+        'refi': 'Рефинансирование'
     }
-    mortgage_purpose = purpose_names.get(purpose_id)
-    await state.update_data(mortgage_purpose=mortgage_purpose)
+    await state.update_data(mpurpose_code=mp, mpurpose_name=names.get(mp, ''))
     await state.set_state(Form.waiting_for_object_type)
-    text = f"🎯 Цель: {mortgage_purpose}\n━━━━━━━━━━━━━━\n\n🏠 Выберите объект:"
-    await callback.message.edit_text(text, reply_markup=get_object_types_menu(), parse_mode="HTML")
+    await callback.message.edit_text(
+        f"🎯 Цель: {names.get(mp)}\n\n🏠 Выберите объект оценки:",
+        reply_markup=get_object_types_menu(), parse_mode="HTML"
+    )
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("report_"))
-async def process_report_type(callback: CallbackQuery, state: FSMContext):
-    report_id = callback.data.split("_")[1]
-    report_type = "Краткая справка" if report_id == "1" else "Отчет об оценке"
-    await state.update_data(report_type=report_type)
+async def select_report_type(callback: CallbackQuery, state: FSMContext):
+    rtype = callback.data.split("_")[1]
+    names = {'short': 'Краткая справка', 'full': 'Отчёт об оценке'}
+    await state.update_data(report_code=rtype, report_name=names.get(rtype, ''))
     await state.set_state(Form.waiting_for_object_type)
-    text = f"📝 Форма: {report_type}\n━━━━━━━━━━━━━━\n\n🏠 Выберите объект:"
-    await callback.message.edit_text(text, reply_markup=get_object_types_menu(), parse_mode="HTML")
+    await callback.message.edit_text(
+        f"📄 Форма: {names.get(rtype)}\n\n🏠 Выберите объект оценки:",
+        reply_markup=get_object_types_menu(), parse_mode="HTML"
+    )
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("object_"))
-async def process_object_type(callback: CallbackQuery, state: FSMContext):
-    object_id = callback.data.split("_")[1]
-    object_names = {
-        "1": "Квартира, комната",
-        "2": "Земельный участок",
-        "3": "Жилой дом/садовый дом/таунхаус",
-        "4": "Нежилое помещение",
-        "5": "Нежилое здание",
-        "6": "Гараж",
-        "7": "Машиноместо"
-    }
-    object_type = object_names.get(object_id)
-    await state.update_data(object_type=object_type)
+@dp.callback_query(F.data.startswith("obj_"))
+async def select_object(callback: CallbackQuery, state: FSMContext):
+    obj = callback.data.split("_")[1]
+    await state.update_data(object_code=obj, object_name=OBJECT_NAMES.get(obj, ''))
     await state.set_state(Form.waiting_for_address)
-
-    text = f"🏠 Объект: {object_type}\n━━━━━━━━━━━━━━\n\n📍 Введите адрес:"
-    await callback.message.edit_text(text, reply_markup=get_back_button(), parse_mode="HTML")
+    await callback.message.edit_text(
+        f"🏠 Объект: {OBJECT_NAMES.get(obj)}\n\n{get_address_hint()}",
+        reply_markup=get_back_button(), parse_mode="HTML"
+    )
     await callback.answer()
 
+
+# ========== ЗАТОПЛЕНИЕ ==========
 
 @dp.callback_query(F.data.startswith("flood_"))
-async def process_flood_object_type(callback: CallbackQuery, state: FSMContext):
-    flood_id = callback.data.split("_")[1]
-    flood_types = {
-        "1": "Квартира, комната",
-        "2": "Жилой дом/садовый дом/таунхаус",
-        "3": "Нежилое помещение"
-    }
-    object_type = flood_types.get(flood_id)
-    await state.update_data(object_type=object_type)
+async def select_flood_object(callback: CallbackQuery, state: FSMContext):
+    obj = callback.data.split("_")[1]
+    names = {'flat': 'Квартира, комната', 'house': 'Дом/таунхаус', 'commercial': 'Нежилое помещение'}
+    await state.update_data(object_code=obj, object_name=names.get(obj, ''))
     await state.set_state(Form.waiting_for_flood_rooms)
-    text = f"🏠 Объект: {object_type}\n━━━━━━━━━━━━━━\n\n🔢 Количество пострадавших помещений:"
-    await callback.message.edit_text(text, reply_markup=get_back_button(), parse_mode="HTML")
+    await callback.message.edit_text(
+        f"🏠 Объект: {names.get(obj)}\n\n"
+        "🚪 Какое количество отдельных помещений пострадало?\n\n"
+        "(комнаты, коридор, санузел, гардеробная, балкон и т.д.)\n\n"
+        "Введите число:",
+        reply_markup=get_back_button(), parse_mode="HTML"
+    )
     await callback.answer()
 
 
 @dp.message(Form.waiting_for_flood_rooms)
 async def process_flood_rooms(message: Message, state: FSMContext):
     try:
-        rooms_count = int(message.text.strip())
-        if rooms_count < 1:
-            await message.answer("❌ Введите положительное число")
+        rooms = int(message.text.strip())
+        if rooms < 1:
+            await message.answer("❌ Введите число больше 0")
             return
-        await state.update_data(rooms_count=rooms_count)
+        await state.update_data(rooms=rooms)
         await state.set_state(Form.waiting_for_address)
-        text = "📍 Введите адрес объекта:"
-        await message.answer(text, reply_markup=get_back_button(), parse_mode="HTML")
+        await message.answer(
+            f"🚪 Помещений: {rooms}\n\n{get_address_hint()}",
+            reply_markup=get_back_button(), parse_mode="HTML"
+        )
     except ValueError:
-        await message.answer("❌ Введите корректное число")
+        await message.answer("❌ Введите число")
 
 
-# ADDRESS PROCESSING
-@dp.message(Form.waiting_for_address)
-async def process_address(message: Message, state: FSMContext):
-    address = message.text.strip()
-    await state.update_data(address=address)
+# ========== БТИ / КАДАСТР / МЕЖЕВАНИЕ ==========
 
-    user_data = await state.get_data()
-    service = user_data.get('service')
-    bti_service = user_data.get('bti_service')
+@dp.callback_query(F.data.startswith("bti_") & ~F.data.startswith("bti_price_") & ~F.data.startswith("bti_address_"))
+async def select_bti_service(callback: CallbackQuery, state: FSMContext):
+    bti = callback.data.split("_")[1]
+    names = {
+        'extract': 'Выписка из техпаспорта (архивная до 2014г.)',
+        'passport': 'Технический паспорт',
+        'plan': 'Технический план',
+        'survey': 'Межевание (земля)',
+        'acts': 'Акты, справки'
+    }
+    await state.update_data(bti_service=bti, bti_service_name=names.get(bti, ''))
 
-    # БТИ выписка
-    if bti_service == "1":
-        admin_text = f"📄 <b>Выписка из технического паспорта</b>\n\nАдрес: {address}\nСтоимость: 500 ₽"
-        await send_to_admins(admin_text, get_user_info(message.from_user))
-
-        text = (
-            "📄 <b>Выписка из техпаспорта</b>\n━━━━━━━━━━━━━━\n\n"
-            "✅ <b>Заявка принята!</b>\n\n"
-            "💎 Стоимость: 500 ₽\n"
-            "⏱️ Готовность: в течение дня\n\n"
-            "📞 Специалист свяжется с вами"
-        )
-        await message.answer(text, reply_markup=get_main_menu_button(), parse_mode="HTML")
-        await state.clear()
-        return
-
-    # БТИ техпаспорт
-    if bti_service == "2":
-        admin_text = (
-            f"📋 <b>Технический паспорт</b>\n\n"
-            f"Тип: {user_data.get('bti_object_name')}\n"
-            f"Адрес: {address}"
-        )
-        await send_to_admins(admin_text, get_user_info(message.from_user))
-
-        text = (
-            "📋 <b>Технический паспорт</b>\n━━━━━━━━━━━━━━\n\n"
-            "✅ <b>Заявка принята!</b>\n\n"
-            "📞 Специалист свяжется с вами"
-        )
-        await message.answer(text, reply_markup=get_main_menu_button(), parse_mode="HTML")
-        await state.clear()
-        return
-
-    # БТИ межевание или акты
-    if user_data.get('surveying_service'):
-        admin_text = f"🗺️ <b>Межевание</b>\n\nУслуга: {user_data.get('surveying_service')}\nАдрес: {address}"
-        await send_to_admins(admin_text, get_user_info(message.from_user))
-
-        text = "🗺️ <b>Межевание</b>\n━━━━━━━━━━━━━━\n\n✅ <b>Заявка принята!</b>\n\n📞 Специалист свяжется с вами"
-        await message.answer(text, reply_markup=get_main_menu_button(), parse_mode="HTML")
-        await state.clear()
-        return
-
-    # Техплан - отправить без расчета
-    if user_data.get('is_tech_plan'):
-        admin_text = (
-            f"📐 <b>Технический план</b>\n\n"
-            f"Объект: {user_data.get('tech_plan_object')}\n"
-            f"Адрес: {address}"
-        )
-        await send_to_admins(admin_text, get_user_info(message.from_user))
-
-        text = "📐 <b>Технический план</b>\n━━━━━━━━━━━━━━\n\n✅ <b>Заявка принята!</b>\n\n📞 Специалист свяжется с вами"
-        await message.answer(text, reply_markup=get_main_menu_button(), parse_mode="HTML")
-        await state.clear()
-        return
-
-    # Geocoding для остальных случаев
-    processing_msg = await message.answer("🔍 Определяем местоположение...")
-
-    lat, lon, full_address = await geocode_address(address)
-
-    if lat is not None and lon is not None:
-        distance_km = calculate_distance(CHELYABINSK_CENTER[0], CHELYABINSK_CENTER[1], lat, lon)
-        distance_km = round(distance_km, 1)
-        in_city = is_in_chelyabinsk(full_address)
-        await state.update_data(distance_km=distance_km, lat=lat, lon=lon, full_address=full_address, in_city=in_city)
-    else:
-        distance_km = 0
-        in_city = True
-        await state.update_data(distance_km=0, in_city=True)
-
-    await processing_msg.delete()
-
-    # ОЦЕНКА НЕДВИЖИМОСТИ
-    if service == 'service_1':
-        bank = user_data.get('bank')
-        mortgage_purpose = user_data.get('mortgage_purpose')
-        report_type = user_data.get('report_type')
-        object_type = user_data.get('object_type')
-
-        if bank and mortgage_purpose:
-            base_price, travel_cost, total_cost = calculate_mortgage_cost(
-                bank, object_type, mortgage_purpose, distance_km, in_city
-            )
-
-            cost_text = "💰 <b>Расчет стоимости</b>\n━━━━━━━━━━━━━━\n\n"
-
-            if lat is not None:
-                cost_text += f"📌 Распознан: {full_address}\n\n"
-
-            cost_text += f"📍 Адрес: {address}\n"
-            cost_text += f"📏 Расстояние: {distance_km} км\n\n"
-
-            if travel_cost > 0:
-                cost_text += f"💵 Базовая: {int(base_price)} ₽\n"
-                cost_text += f"🚗 Выезд: {int(travel_cost)} ₽\n\n"
-                cost_text += f"💎 ИТОГО: {int(total_cost)} ₽\n\n"
-            else:
-                cost_text += f"💎 ИТОГО: {int(total_cost)} ₽\n\n"
-
-            cost_text += "📅 Срок: 1-2 дня\n\n"
-            cost_text += "⚠️ Дополнительно:\n"
-            cost_text += "• >150 кв.м: +1000 ₽/150 кв.м\n"
-            cost_text += "• Срочность: ×1.3\n\n"
-            cost_text += "📅 Введите дату и время осмотра:"
-
-            await state.update_data(cost=int(total_cost))
-            await state.set_state(Form.waiting_for_date)
-            await message.answer(cost_text, reply_markup=get_back_button(), parse_mode="HTML")
-
-        elif report_type:
-            if report_type == "Краткая справка":
-                base_price, travel_cost, total_cost = calculate_other_purpose_cost(
-                    object_type, report_type, distance_km, in_city
-                )
-                text = (
-                    f"📄 <b>Краткая справка</b>\n━━━━━━━━━━━━━━\n\n"
-                    f"💎 Стоимость: {int(total_cost)} ₽\n"
-                    f"⏱️ Готовность: в течение дня\n\n"
-                    f"📎 Прикрепите документы или отправьте на:\n"
-                    f"📧 7511327@mail.ru\n\n"
-                    f"📋 Документы:\n"
-                    f"1. Выписка ЕГРН\n"
-                    f"2. Паспорт заказчика"
-                )
-                await message.answer(text, reply_markup=get_documents_menu(), parse_mode="HTML")
-                await state.update_data(cost=int(total_cost))
-                await state.set_state(Form.waiting_for_documents)
-            else:
-                base_price, travel_cost, total_cost = calculate_other_purpose_cost(
-                    object_type, report_type, distance_km, in_city
-                )
-
-                cost_text = "📊 <b>Отчет об оценке</b>\n━━━━━━━━━━━━━━\n\n"
-
-                if lat is not None:
-                    cost_text += f"📌 Распознан: {full_address}\n\n"
-
-                cost_text += f"📍 Адрес: {address}\n"
-                cost_text += f"📏 Расстояние: {distance_km} км\n\n"
-
-                if travel_cost > 0:
-                    cost_text += f"💵 Базовая: {int(base_price)} ₽\n"
-                    cost_text += f"🚗 Выезд: {int(travel_cost)} ₽\n\n"
-                    cost_text += f"💎 ИТОГО: {int(total_cost)} ₽\n\n"
-                else:
-                    cost_text += f"💎 ИТОГО: {int(total_cost)} ₽\n\n"
-
-                cost_text += "📅 Срок: 1-2 дня\n\n"
-                cost_text += "⚠️ Дополнительно:\n"
-                cost_text += "• >150 кв.м: +1000 ₽/150 кв.м\n"
-                cost_text += "• Срочность: ×1.3\n\n"
-                cost_text += "📅 Введите дату и время:"
-
-                await state.update_data(cost=int(total_cost))
-                await state.set_state(Form.waiting_for_date)
-                await message.answer(cost_text, reply_markup=get_back_button(), parse_mode="HTML")
-
-    # ОЦЕНКА УЩЕРБА
-    elif service == 'service_2':
-        object_type = user_data.get('object_type')
-        rooms_count = user_data.get('rooms_count', 1)
-
-        base_price, rooms_cost, travel_cost, total_cost = calculate_flood_cost(
-            object_type, rooms_count, distance_km, in_city
+    if bti == 'extract':
+        await state.set_state(Form.waiting_for_address)
+        await callback.message.edit_text(
+            f"📄 <b>{names.get(bti)}</b>\n\n{get_address_hint()}",
+            reply_markup=get_back_button(), parse_mode="HTML"
         )
 
-        cost_text = "💧 <b>Оценка ущерба</b>\n━━━━━━━━━━━━━━\n\n"
-
-        if lat is not None:
-            cost_text += f"📌 Распознан: {full_address}\n\n"
-
-        cost_text += f"📍 Адрес: {address}\n"
-        cost_text += f"📏 Расстояние: {distance_km} км\n"
-        cost_text += f"🔢 Помещений: {rooms_count}\n\n"
-
-        cost_text += f"💵 Базовая: {int(base_price)} ₽\n"
-        if rooms_cost > 0:
-            cost_text += f"➕ Доп. помещения: {int(rooms_cost)} ₽\n"
-        if travel_cost > 0:
-            cost_text += f"🚗 Выезд: {int(travel_cost)} ₽\n"
-        cost_text += f"\n💎 ИТОГО: {int(total_cost)} ₽\n\n"
-
-        cost_text += "📅 Срок: 3-5 дней\n\n"
-        cost_text += "📅 Введите дату осмотра:"
-
-        await state.update_data(cost=int(total_cost))
-        await state.set_state(Form.waiting_for_date)
-        await message.answer(cost_text, reply_markup=get_back_button(), parse_mode="HTML")
-
-    # ПРИЕМКА
-    elif user_data.get('acceptance_area'):
-        area = user_data.get('acceptance_area')
-        base_price, travel_cost, total_cost = calculate_acceptance_cost(area, distance_km, in_city)
-
-        cost_text = "🏡 <b>Приемка дома</b>\n━━━━━━━━━━━━━━\n\n"
-
-        if lat is not None:
-            cost_text += f"📌 Распознан: {full_address}\n\n"
-
-        cost_text += f"📍 Адрес: {address}\n"
-        cost_text += f"📏 Расстояние: {distance_km} км\n\n"
-
-        if travel_cost > 0:
-            cost_text += f"💵 Базовая: {int(base_price)} ₽\n"
-            cost_text += f"🚗 Выезд: {int(travel_cost)} ₽\n\n"
-            cost_text += f"💎 ИТОГО: {int(total_cost)} ₽\n\n"
-        else:
-            cost_text += f"💎 ИТОГО: {int(total_cost)} ₽\n\n"
-
-        cost_text += "📅 Введите дату выезда:"
-
-        await state.update_data(cost=int(total_cost))
-        await state.set_state(Form.waiting_for_date)
-        await message.answer(cost_text, reply_markup=get_back_button(), parse_mode="HTML")
-
-    # ОБСЛЕДОВАНИЕ
-    elif user_data.get('inspection_area'):
-        area = user_data.get('inspection_area')
-        base_price, travel_cost, total_cost = calculate_inspection_cost(area, distance_km, in_city)
-
-        cost_text = "🏠 <b>Обследование дома</b>\n━━━━━━━━━━━━━━\n\n"
-
-        if lat is not None:
-            cost_text += f"📌 Распознан: {full_address}\n\n"
-
-        cost_text += f"📍 Адрес: {address}\n"
-        cost_text += f"📏 Расстояние: {distance_km} км\n\n"
-
-        if travel_cost > 0:
-            cost_text += f"💵 Базовая: {int(base_price)} ₽\n"
-            cost_text += f"🚗 Выезд: {int(travel_cost)} ₽\n\n"
-            cost_text += f"💎 ИТОГО: {int(total_cost)} ₽\n\n"
-        else:
-            cost_text += f"💎 ИТОГО: {int(total_cost)} ₽\n\n"
-
-        cost_text += "📅 Введите дату осмотра:"
-
-        await state.update_data(cost=int(total_cost))
-        await state.set_state(Form.waiting_for_date)
-        await message.answer(cost_text, reply_markup=get_back_button(), parse_mode="HTML")
-
-    # ТЕПЛОВИЗОР
-    elif user_data.get('thermal_area'):
-        object_type = user_data.get('thermal_object')
-        area = user_data.get('thermal_area')
-        base_price, travel_cost, total_cost = calculate_thermal_cost(object_type, area, distance_km, in_city)
-
-        cost_text = "🌡️ <b>Тепловизионное обследование</b>\n━━━━━━━━━━━━━━\n\n"
-
-        if lat is not None:
-            cost_text += f"📌 Распознан: {full_address}\n\n"
-
-        cost_text += f"📍 Адрес: {address}\n"
-        cost_text += f"📏 Расстояние: {distance_km} км\n\n"
-
-        if travel_cost > 0:
-            cost_text += f"💵 Базовая: {int(base_price)} ₽\n"
-            cost_text += f"🚗 Выезд: {int(travel_cost)} ₽\n\n"
-            cost_text += f"💎 ИТОГО: {int(total_cost)} ₽\n\n"
-        else:
-            cost_text += f"💎 ИТОГО: {int(total_cost)} ₽\n\n"
-
-        cost_text += "📅 Введите дату осмотра:"
-
-        await state.update_data(cost=int(total_cost))
-        await state.set_state(Form.waiting_for_date)
-        await message.answer(cost_text, reply_markup=get_back_button(), parse_mode="HTML")
-
-
-@dp.message(Form.waiting_for_date)
-async def process_date(message: Message, state: FSMContext):
-    date = message.text.strip()
-    await state.update_data(date=date)
-
-    user_data = await state.get_data()
-    service = user_data.get('service')
-    mortgage_purpose = user_data.get('mortgage_purpose')
-
-    if service == 'service_1':
-        if mortgage_purpose:
-            if mortgage_purpose in ["Оформление ипотеки", "Рефинансирование"]:
-                docs_text = (
-                    "📎 <b>Прикрепите документы</b>\n━━━━━━━━━━━━━━\n\n"
-                    "📧 7511327@mail.ru\n\n"
-                    "📋 Документы:\n"
-                    "1. Выписка ЕГРН\n"
-                    "2. Техпаспорт/Техплан\n"
-                    "3. Паспорта собственников и заемщика"
-                )
-            else:
-                object_type = user_data.get('object_type')
-                if object_type == "Квартира, комната":
-                    docs_text = (
-                        "📎 <b>Прикрепите документы</b>\n━━━━━━━━━━━━━━\n\n"
-                        "📧 7511327@mail.ru\n\n"
-                        "📋 Для квартиры:\n"
-                        "1. Договор ДДУ/уступки/купли-продажи\n"
-                        "2. Акт приема-передачи\n"
-                        "3. Паспорт заемщика"
-                    )
-                elif object_type == "Жилой дом/садовый дом/таунхаус":
-                    docs_text = (
-                        "📎 <b>Прикрепите документы</b>\n━━━━━━━━━━━━━━\n\n"
-                        "📧 7511327@mail.ru\n\n"
-                        "📋 Для дома:\n"
-                        "1. Выписка ЕГРН (дом + участок)\n"
-                        "2. Технический план\n"
-                        "3. Паспорт заемщика"
-                    )
-                else:
-                    docs_text = (
-                        "📎 <b>Прикрепите документы</b>\n━━━━━━━━━━━━━━\n\n"
-                        "📧 7511327@mail.ru\n\n"
-                        "📋 Документы:\n"
-                        "1. Выписка ЕГРН\n"
-                        "2. Паспорт заемщика"
-                    )
-        else:
-            docs_text = (
-                "📎 <b>Прикрепите документы</b>\n━━━━━━━━━━━━━━\n\n"
-                "📧 7511327@mail.ru\n\n"
-                "📋 Документы:\n"
-                "1. Выписка ЕГРН\n"
-                "2. Паспорт заказчика"
-            )
-    elif service == 'service_2':
-        docs_text = (
-            "📎 <b>Прикрепите документы</b>\n━━━━━━━━━━━━━━\n\n"
-            "📧 7511327@mail.ru\n\n"
-            "📋 Документы:\n"
-            "1. Выписка ЕГРН\n"
-            "2. Паспорт заказчика\n"
-            "3. Акт от УК\n"
-            "4. Техпаспорт (при наличии)"
-        )
-    else:
-        docs_text = (
-            "📎 <b>Прикрепите документы</b>\n━━━━━━━━━━━━━━\n\n"
-            "📧 7511327@mail.ru"
+    elif bti == 'passport':
+        await callback.message.edit_text(
+            f"📋 <b>{names.get(bti)}</b>\n\n👇 Выберите действие:",
+            reply_markup=get_bti_price_menu('passport'), parse_mode="HTML"
         )
 
-    await state.set_state(Form.waiting_for_documents)
-    await message.answer(docs_text, reply_markup=get_documents_menu(), parse_mode="HTML")
+    elif bti == 'plan':
+        await callback.message.edit_text(
+            f"📐 <b>{names.get(bti)}</b>\n\n👇 Выберите действие:",
+            reply_markup=get_bti_price_menu('plan'), parse_mode="HTML"
+        )
 
+    elif bti == 'survey':
+        await callback.message.edit_text(
+            f"🗺 <b>{names.get(bti)}</b>\n\n👇 Выберите действие:",
+            reply_markup=get_bti_price_menu('survey'), parse_mode="HTML"
+        )
 
-# INSURANCE HANDLERS
-@dp.callback_query(F.data.startswith("insurance_"))
-async def process_insurance_type(callback: CallbackQuery, state: FSMContext):
-    if callback.data == "insurance_new":
-        await state.update_data(insurance_type="new")
-        await state.set_state(Form.waiting_for_insurance_coverage)
-        text = "🆕 <b>Новая ипотека</b>\n━━━━━━━━━━━━━━\n\n🛡️ Что страхуем?"
-        await callback.message.edit_text(text, reply_markup=get_insurance_coverage_menu(), parse_mode="HTML")
-    elif callback.data == "insurance_renewal":
-        await state.update_data(insurance_type="renewal")
-        await state.set_state(Form.waiting_for_insurance_coverage)
-        text = "🔄 <b>Продление договора</b>\n━━━━━━━━━━━━━━\n\n🛡️ Что страхуем?"
-        await callback.message.edit_text(text, reply_markup=get_insurance_coverage_menu(), parse_mode="HTML")
+    elif bti == 'acts':
+        await callback.message.edit_text(
+            f"📑 <b>{names.get(bti)}</b>\n\n👇 Выберите действие:",
+            reply_markup=get_bti_price_menu('acts'), parse_mode="HTML"
+        )
+
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("coverage_"))
-async def process_insurance_coverage(callback: CallbackQuery, state: FSMContext):
-    coverage = callback.data.split("_")[1]
-    coverage_names = {
-        "property": "Недвижимость (конструктив)",
-        "life": "Жизнь"
+# Прайсы БТИ
+@dp.callback_query(F.data.startswith("bti_price_"))
+async def show_bti_price(callback: CallbackQuery, state: FSMContext):
+    service = callback.data.split("_")[2]
+    price_images = {
+        'passport': '(Прайс тех.паспорт).JPG',
+        'plan': '(Прайс тех.план).JPG',
+        'survey': '(Прайс межевание).JPG',
+        'acts': '(Прайс Акты, справки).JPG'
     }
-    coverage_name = coverage_names.get(coverage)
-    await state.update_data(insurance_coverage=coverage, insurance_coverage_name=coverage_name)
+    image_name = price_images.get(service)
+    if image_name:
+        await send_price_image(callback, image_name)
+    await callback.answer()
+
+
+# Адрес для БТИ
+@dp.callback_query(F.data.startswith("bti_address_"))
+async def bti_address_step(callback: CallbackQuery, state: FSMContext):
+    service = callback.data.split("_")[2]
+    data = await state.get_data()
+
+    if service == 'plan':
+        await state.set_state(Form.waiting_for_bti_object_type)
+        await callback.message.edit_text(
+            "📐 <b>Технический план</b>\n\n🏠 Выберите объект:",
+            reply_markup=get_bti_plan_objects_menu(), parse_mode="HTML"
+        )
+    elif service == 'survey':
+        await state.set_state(Form.waiting_for_bti_surveying_service)
+        await callback.message.edit_text(
+            "🗺 <b>Межевание</b>\n\n👇 Выберите услугу:",
+            reply_markup=get_survey_services_menu(), parse_mode="HTML"
+        )
+    elif service == 'acts':
+        await state.set_state(Form.waiting_for_bti_acts_service)
+        await callback.message.edit_text(
+            "📑 <b>Акты, справки</b>\n\n👇 Выберите услугу:",
+            reply_markup=get_acts_services_menu(), parse_mode="HTML"
+        )
+    else:  # passport
+        await state.set_state(Form.waiting_for_address)
+        await callback.message.edit_text(
+            f"📋 <b>Технический паспорт</b>\n\n{get_address_hint()}",
+            reply_markup=get_back_button(), parse_mode="HTML"
+        )
+    await callback.answer()
+
+
+# Объекты для тех.плана
+@dp.callback_query(F.data.startswith("btiplan_"))
+async def select_bti_plan_object(callback: CallbackQuery, state: FSMContext):
+    obj = callback.data.split("_")[1]
+    names = {
+        'flat': 'Квартира, комната', 'house': 'Жилой/садовый дом',
+        'commercial': 'Нежилое помещение', 'building': 'Нежилое здание',
+        'garage': 'Гараж', 'split_house': 'Раздел дома',
+        'split_rooms': 'Раздел/объединение помещений'
+    }
+    await state.update_data(bti_object_code=obj, bti_object_name=names.get(obj, ''))
+    await state.set_state(Form.waiting_for_address)
+    await callback.message.edit_text(
+        f"🏠 Объект: {names.get(obj)}\n\n{get_address_hint()}",
+        reply_markup=get_back_button(), parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+# Услуги межевания
+@dp.callback_query(F.data.startswith("surv_"))
+async def select_survey_service(callback: CallbackQuery, state: FSMContext):
+    srv = callback.data.split("_")[1]
+    names = {
+        'borders': 'Уточнение границ ЗУ', 'split': 'Раздел/объединение участка',
+        'kuizo': 'Схема для КУиЗО', 'redistr': 'Перераспределение (межевой)',
+        'redistr_full': 'Перераспределение (схема+межевой)', 'garage': 'Схема под гараж',
+        'order': 'Межевой по распоряжению', 'court': 'Межевой для суда',
+        'servitude': 'Межевой на сервитут', 'other': 'Другое'
+    }
+    await state.update_data(survey_service=srv, survey_service_name=names.get(srv, ''))
+    await state.set_state(Form.waiting_for_address)
+    await callback.message.edit_text(
+        f"📐 {names.get(srv)}\n\n"
+        "📍 Введите кадастровый номер земельного участка:\n"
+        "Пример: <code>74:27:080301:1234</code>",
+        reply_markup=get_back_button(), parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+# Услуги актов/справок
+@dp.callback_query(F.data.startswith("acts_"))
+async def select_acts_service(callback: CallbackQuery, state: FSMContext):
+    srv = callback.data.split("_")[1]
+    names = {
+        'input': 'Документы на акт ввода до 1500 кв.м', 'garage': 'На гараж',
+        'demolish': 'Акт сноса', 'location': 'Справка о местоположении',
+        'cost': 'Справка о стоимости', 'notify': 'Заполнение уведомлений',
+        'other': 'Другое'
+    }
+    await state.update_data(acts_service=srv, acts_service_name=names.get(srv, ''))
+
+    # Сразу отправляем заявку
+    data = await state.get_data()
+    data['bti_service_name'] = f"Акты/справки: {names.get(srv)}"
+    order_text = await format_order_text(data)
+    await send_to_admins(order_text, get_user_info(callback.from_user))
+
+    await callback.message.edit_text(
+        f"✅ <b>Заявка принята!</b>\n\n📋 {names.get(srv)}\n\n"
+        "📞 Наш специалист свяжется с вами в ближайшее время",
+        reply_markup=get_main_menu_button(), parse_mode="HTML"
+    )
+    await state.clear()
+    await callback.answer()
+
+
+# ========== ЭКСПЕРТИЗА / ОБСЛЕДОВАНИЯ ==========
+
+@dp.callback_query(F.data.startswith("exp_"))
+async def select_expertise_type(callback: CallbackQuery, state: FSMContext):
+    exp = callback.data.split("_")[1]
+    names = {
+        'build': 'Строительно-техническая экспертиза',
+        'accept': 'Приёмка дома от застройщика',
+        'inspect': 'Обследование перед покупкой',
+        'thermal': 'Тепловизионное обследование'
+    }
+    await state.update_data(exp_type=exp, exp_type_name=names.get(exp, ''))
+
+    if exp == 'build':
+        await state.set_state(Form.waiting_for_expertise_stage)
+        await callback.message.edit_text(
+            "🔍 <b>Строительно-техническая экспертиза</b>\n\n"
+            "Здравствуйте!\n"
+            "Я помогу оформить заявку на строительно-техническую экспертизу.\n"
+            "Ответьте, пожалуйста, на несколько вопросов.\n\n"
+            "⚖ На каком этапе сейчас находится ваш спор или ситуация?",
+            reply_markup=get_expertise_stage_menu(), parse_mode="HTML"
+        )
+
+    elif exp == 'accept':
+        await state.set_state(Form.waiting_for_acceptance_state)
+        await callback.message.edit_text(
+            "🏡 <b>Приёмка жилого дома от застройщика</b>\n\n"
+            "Здравствуйте!\n"
+            "Я помогу оформить заявку на приёмку жилого дома.\n\n"
+            "🎨 Какое состояние внутренней отделки жилого дома?",
+            reply_markup=get_acceptance_finish_menu(), parse_mode="HTML"
+        )
+
+    elif exp == 'inspect':
+        await callback.message.edit_text(
+            "🏠 <b>Техническое обследование перед покупкой</b>\n\n"
+            "✔ Тщательный осмотр с инструментальным обследованием\n"
+            "✔ Выявление скрытых дефектов\n"
+            "✔ Оценка реального состояния дома\n"
+            "✔ Консультация и рекомендации\n"
+            "✔ Аргументация для торга\n\n"
+            "<b>Используемое оборудование:</b>\n"
+            "📌 Склерометр — прочность бетона\n"
+            "📌 Лазерный уровень — геометрия стен\n"
+            "📌 Влагомер — скрытая сырость\n"
+            "📌 Тепловизор — теплопотери\n"
+            "📌 Эндоскоп — скрытые полости\n"
+            "📌 Тестер электропроводки\n\n"
+            "📏 Укажите площадь дома:",
+            reply_markup=get_inspection_area_menu(), parse_mode="HTML"
+        )
+        await state.set_state(Form.waiting_for_inspection_area)
+
+    elif exp == 'thermal':
+        await state.set_state(Form.waiting_for_thermal_object)
+        await callback.message.edit_text(
+            "🌡 <b>Тепловизионное обследование</b>\n\n"
+            "Здравствуйте!\n"
+            "Я помогу оформить заявку на тепловизионное обследование.\n\n"
+            "🏠 Выберите объект:",
+            reply_markup=get_thermal_object_menu(), parse_mode="HTML"
+        )
+
+    await callback.answer()
+
+
+# Строительная экспертиза — этап
+@dp.callback_query(F.data.startswith("expstage_"))
+async def select_expertise_stage(callback: CallbackQuery, state: FSMContext):
+    stage = callback.data.split("_")[1]
+    names = {
+        'court': 'Уже идёт судебный процесс',
+        'pretrial': 'Досудебное урегулирование',
+        'unknown': 'Затрудняюсь ответить'
+    }
+    await state.update_data(exp_stage=stage, exp_stage_name=names.get(stage, ''))
+    await state.set_state(Form.waiting_for_expertise_object)
+    await callback.message.edit_text(
+        "🏠 Какой объект требуется обследовать?",
+        reply_markup=get_expertise_object_menu(), parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+# Строительная экспертиза — объект
+@dp.callback_query(F.data.startswith("expobj_"))
+async def select_expertise_object(callback: CallbackQuery, state: FSMContext):
+    obj = callback.data.split("_")[1]
+    names = {
+        'flat': 'Квартира', 'house': 'Жилой дом / коттедж',
+        'commercial': 'Помещение / офис', 'roof': 'Кровля',
+        'foundation': 'Фундамент', 'other': 'Другое'
+    }
+    await state.update_data(exp_object=obj, exp_object_name=names.get(obj, ''))
+    await state.set_state(Form.waiting_for_expertise_status)
+    await callback.message.edit_text(
+        "🔧 Объект уже построен или находится в процессе строительства?",
+        reply_markup=get_expertise_status_menu(), parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+# Строительная экспертиза — статус
+@dp.callback_query(F.data.startswith("expstat_"))
+async def select_expertise_status(callback: CallbackQuery, state: FSMContext):
+    status = callback.data.split("_")[1]
+    names = {
+        'built': 'Построен',
+        'building': 'В процессе строительства',
+        'renovated': 'После ремонта / реконструкции'
+    }
+    await state.update_data(exp_status=status, exp_status_name=names.get(status, ''), exp_goals=[])
+    await state.set_state(Form.waiting_for_expertise_goals)
+    await callback.message.edit_text(
+        "🎯 Что нужно определить или исследовать в рамках экспертизы?\n"
+        "(можно выбрать несколько вариантов, затем нажмите «Продолжить»)",
+        reply_markup=get_expertise_goals_menu(), parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+# Строительная экспертиза — цели (множественный выбор)
+@dp.callback_query(F.data.startswith("expgoal_"))
+async def select_expertise_goal(callback: CallbackQuery, state: FSMContext):
+    goal = callback.data.split("_")[1]
+
+    if goal == 'done':
+        await state.set_state(Form.waiting_for_expertise_description)
+        await callback.message.edit_text(
+            "📝 Опишите, пожалуйста, коротко, какие есть проблемы или что вызывает сомнения.\n\n"
+            "(например: трещины, протечки, неровная кладка, плесень, не совпадает со сметой и т.д.)",
+            reply_markup=get_back_button(), parse_mode="HTML"
+        )
+    else:
+        data = await state.get_data()
+        goals = data.get('exp_goals', [])
+        goal_names = {
+            'defects': 'Выявить дефекты и нарушения',
+            'cost': 'Рассчитать стоимость устранения',
+            'volume': 'Оценить объём работ',
+            'docs': 'Проверить соответствие документации',
+            'claims': 'Подтвердить/опровергнуть претензии',
+            'complex': 'Комплексное обследование',
+            'other': 'Другое'
+        }
+        goal_name = goal_names.get(goal, goal)
+        if goal_name not in goals:
+            goals.append(goal_name)
+        await state.update_data(exp_goals=goals)
+        await callback.answer(f"✅ Добавлено: {goal_name}")
+        return
+
+    await callback.answer()
+
+
+# Строительная экспертиза — описание проблемы
+@dp.message(Form.waiting_for_expertise_description)
+async def process_expertise_description(message: Message, state: FSMContext):
+    await state.update_data(exp_description=message.text, documents=[])
+    await state.set_state(Form.waiting_for_expertise_photos)
+    await message.answer(
+        "📸 Прикрепите, если возможно, фото или видео проблемных мест.\n"
+        "(можно отправить несколько фото подряд)\n\n"
+        "Или нажмите кнопку для отправки заявки:",
+        reply_markup=get_finish_docs_menu(), parse_mode="HTML"
+    )
+
+
+# Строительная экспертиза — фото
+@dp.message(Form.waiting_for_expertise_photos, F.photo)
+async def process_expertise_photo(message: Message, state: FSMContext):
+    data = await state.get_data()
+    docs = data.get('documents', [])
+    docs.append({'type': 'photo', 'file_id': message.photo[-1].file_id, 'caption': 'Фото к экспертизе'})
+    await state.update_data(documents=docs)
+    await message.answer(
+        f"✅ Фото добавлено ({len(docs)} шт)\n\nДобавьте ещё или отправьте заявку:",
+        reply_markup=get_finish_docs_menu()
+    )
+
+
+# ========== ПРИЁМКА ОТ ЗАСТРОЙЩИКА ==========
+
+@dp.callback_query(F.data.startswith("accfin_"))
+async def select_acceptance_finish(callback: CallbackQuery, state: FSMContext):
+    fin = callback.data.split("_")[1]
+    names = {'rough': 'Черновая (без отделки)', 'pre': 'Предчистовая', 'final': 'Чистовая (с отделкой)'}
+    await state.update_data(acc_finish=fin, acc_finish_name=names.get(fin, ''))
+    await state.set_state(Form.waiting_for_acceptance_material)
+    await callback.message.edit_text(
+        "🧱 Какой материал стен?",
+        reply_markup=get_acceptance_material_menu(), parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("accmat_"))
+async def select_acceptance_material(callback: CallbackQuery, state: FSMContext):
+    mat = callback.data.split("_")[1]
+    names = {'brick': 'Кирпич', 'panel': 'Ж/б панели', 'block': 'Блочный', 'wood': 'Дерево', 'other': 'Другой'}
+    await state.update_data(acc_material=mat, acc_material_name=names.get(mat, ''))
+    await state.set_state(Form.waiting_for_acceptance_area)
+    await callback.message.edit_text(
+        "📏 Какая площадь объекта?",
+        reply_markup=get_acceptance_area_menu(), parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("accarea_"))
+async def select_acceptance_area(callback: CallbackQuery, state: FSMContext):
+    area = callback.data.split("_")[1]
+    names = {'150': 'до 150 м²', '250': '150-250 м²', '500': '250-500 м²'}
+    await state.update_data(acc_area=area, acc_area_name=names.get(area, ''))
+    await state.set_state(Form.waiting_for_address)
+    await callback.message.edit_text(
+        f"📏 Площадь: {names.get(area)}\n\n{get_address_hint()}",
+        reply_markup=get_back_button(), parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+# ========== ОБСЛЕДОВАНИЕ ПЕРЕД ПОКУПКОЙ ==========
+
+@dp.callback_query(F.data.startswith("insparea_"))
+async def select_inspection_area(callback: CallbackQuery, state: FSMContext):
+    area = callback.data.split("_")[1]
+    names = {'150': 'до 150 м²', '250': '150-250 м²', '350': '250-350 м²', '350plus': 'свыше 350 м²'}
+    await state.update_data(insp_area=area, insp_area_name=names.get(area, ''))
+    await state.set_state(Form.waiting_for_inspection_material)
+    await callback.message.edit_text(
+        "🧱 Какой материал стен дома?",
+        reply_markup=get_inspection_material_menu(), parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("inspmat_"))
+async def select_inspection_material(callback: CallbackQuery, state: FSMContext):
+    mat = callback.data.split("_")[1]
+    names = {'brick': 'Кирпич', 'panel': 'Ж/б панели', 'block': 'Блочный', 'wood': 'Дерево', 'other': 'Другой'}
+    await state.update_data(insp_material=mat, insp_material_name=names.get(mat, ''))
+    await state.set_state(Form.waiting_for_inspection_finish)
+    await callback.message.edit_text(
+        "🎨 Какое состояние внутренней отделки?\n\n"
+        "<i>Примечание: Объективную оценку состояния дома можно провести "
+        "только на объектах без отделки или с минимальной отделкой.</i>",
+        reply_markup=get_inspection_finish_menu(), parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("inspfin_"))
+async def select_inspection_finish(callback: CallbackQuery, state: FSMContext):
+    fin = callback.data.split("_")[1]
+    names = {'rough': 'Черновая', 'pre': 'Предчистовая', 'final': 'Чистовая'}
+    await state.update_data(insp_finish=fin, insp_finish_name=names.get(fin, ''))
+    await state.set_state(Form.waiting_for_address)
+    await callback.message.edit_text(
+        f"🎨 Отделка: {names.get(fin)}\n\n{get_address_hint()}",
+        reply_markup=get_back_button(), parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+# ========== ТЕПЛОВИЗОР ==========
+
+@dp.callback_query(F.data.startswith("thermobj_"))
+async def select_thermal_object(callback: CallbackQuery, state: FSMContext):
+    obj = callback.data.split("_")[1]
+    names = {'flat': 'Квартира', 'house': 'Жилой дом'}
+    await state.update_data(therm_object=obj, therm_object_name=names.get(obj, ''))
+    await state.set_state(Form.waiting_for_thermal_area)
+    await callback.message.edit_text(
+        "📏 Укажите площадь:",
+        reply_markup=get_thermal_area_menu(), parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("thermarea_"))
+async def select_thermal_area(callback: CallbackQuery, state: FSMContext):
+    area = callback.data.split("_")[1]
+    names = {'100': 'до 100 м²', '200': '100-200 м²', '300': '200-300 м²', '300plus': 'свыше 300 м²'}
+    await state.update_data(therm_area=area, therm_area_name=names.get(area, ''))
+    await state.set_state(Form.waiting_for_address)
+    await callback.message.edit_text(
+        f"📏 Площадь: {names.get(area)}\n\n{get_address_hint()}",
+        reply_markup=get_back_button(), parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+# ========== СТРАХОВАНИЕ ==========
+
+@dp.callback_query(F.data.startswith("ins_"))
+async def select_insurance_type(callback: CallbackQuery, state: FSMContext):
+    ins = callback.data.split("_")[1]
+    names = {'new': 'Новая ипотека', 'renew': 'Продление договора'}
+    await state.update_data(ins_type=ins, ins_type_name=names.get(ins, ''))
+    await state.set_state(Form.waiting_for_insurance_coverage)
+    await callback.message.edit_text(
+        f"🛡 {names.get(ins)}\n\n👇 Выберите, что хотите застраховать:",
+        reply_markup=get_insurance_coverage_menu(), parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("inscov_"))
+async def select_insurance_coverage(callback: CallbackQuery, state: FSMContext):
+    cov = callback.data.split("_")[1]
+    names = {'property': 'Недвижимость (конструктив)', 'life': 'Жизнь', 'both': 'Недвижимость + Жизнь'}
+    await state.update_data(ins_coverage=cov, ins_coverage_name=names.get(cov, ''))
     await state.set_state(Form.waiting_for_insurance_object)
-
-    text = f"🛡️ Страхование: {coverage_name}\n━━━━━━━━━━━━━━\n\n🏠 Объект:"
-    await callback.message.edit_text(text, reply_markup=get_insurance_object_menu(), parse_mode="HTML")
+    await callback.message.edit_text(
+        "🏠 Объект страхования:",
+        reply_markup=get_insurance_object_menu(), parse_mode="HTML"
+    )
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("ins_object_"))
-async def process_insurance_object(callback: CallbackQuery, state: FSMContext):
-    object_id = callback.data.split("_")[2]
-    object_names = {
-        "1": "Квартира, комната",
-        "2": "Жилой дом/садовый дом/таунхаус"
-    }
-    object_type = object_names.get(object_id)
-    await state.update_data(insurance_object=object_type)
+@dp.callback_query(F.data.startswith("insobj_"))
+async def select_insurance_object(callback: CallbackQuery, state: FSMContext):
+    obj = callback.data.split("_")[1]
+    names = {'flat': 'Квартира, комната', 'house': 'Дом/таунхаус'}
+    await state.update_data(ins_object=obj, ins_object_name=names.get(obj, ''))
     await state.set_state(Form.waiting_for_mortgage_balance)
-
-    text = f"🏠 Объект: {object_type}\n━━━━━━━━━━━━━━\n\n💰 Введите остаток по ипотеке (в рублях):"
-    await callback.message.edit_text(text, reply_markup=get_back_button(), parse_mode="HTML")
+    await callback.message.edit_text(
+        "💳 Введите остаток по ипотеке на сегодня (в рублях):\n\n"
+        "Пример: <code>2500000</code>",
+        reply_markup=get_back_button(), parse_mode="HTML"
+    )
     await callback.answer()
 
 
 @dp.message(Form.waiting_for_mortgage_balance)
 async def process_mortgage_balance(message: Message, state: FSMContext):
     try:
-        balance = float(message.text.strip().replace(" ", "").replace(",", "."))
+        balance = float(message.text.replace(' ', '').replace(',', '.'))
         if balance <= 0:
-            await message.answer("❌ Введите положительную сумму")
+            await message.answer("❌ Введите положительное число")
             return
 
-        await state.update_data(mortgage_balance=balance)
-        user_data = await state.get_data()
+        data = await state.get_data()
+        cost = calculate_insurance_cost(data.get('ins_object', 'flat'), balance)
+        await state.update_data(balance=balance, cost=cost, documents=[])
 
-        object_type = user_data.get('insurance_object')
-        insurance_cost = calculate_insurance_cost(object_type, balance)
+        ins_type = data.get('ins_type', 'new')
+        ins_coverage = data.get('ins_coverage', 'property')
 
-        await state.update_data(insurance_cost=insurance_cost)
+        text = f"💰 <b>Предварительный расчёт</b>\n\n"
+        text += f"💳 Остаток: {int(balance):,} ₽\n".replace(',', ' ')
+        text += f"🛡 Стоимость полиса: ~{cost} ₽\n\n"
+        text += "<b>Для точного расчёта нужны документы:</b>\n\n"
 
-        text = (
-            f"💸 <b>Предварительный расчет</b>\n━━━━━━━━━━━━━━\n\n"
-            f"💎 Стоимость полиса: {insurance_cost} ₽\n\n"
-            f"Это предварительный расчёт.\n"
-            f"Для точного расчёта прикрепите документы\n\n"
-        )
+        if ins_type == 'new':
+            text += "• Паспорт (фото + прописка)\n"
+            text += "• Выписка ЕГРН\n"
+            text += "• Отчёт об оценке\n"
+            text += "• Кредитный договор\n"
+        else:  # renew
+            text += "• Предыдущий страховой договор\n"
+            text += "• Действующий кредитный договор\n"
 
-        insurance_type = user_data.get('insurance_type')
-        insurance_coverage = user_data.get('insurance_coverage')
-
-        if insurance_type == "new":
-            text += "📋 Документы:\n"
-            text += "1. Паспорт (фото и прописка)\n"
-            text += "2. Выписка ЕГРН\n"
-            text += "3. Отчёт об оценке\n"
-            text += "4. Кредитный договор\n"
-        else:
-            text += "📋 Документы:\n"
-            text += "1. Предыдущий страховой договор\n"
-            text += "2. Действующий кредитный договор\n"
-
-        if insurance_coverage == "life":
-            text += "\nДополнительно укажите:\n"
+        if ins_coverage in ['life', 'both']:
+            text += "\n<b>Для страхования жизни укажите:</b>\n"
             text += "• Профессия\n"
             text += "• Состояние здоровья\n"
-            text += "• Занятие спортом\n"
+            text += "• Занятие профессиональным спортом\n"
+            await state.set_state(Form.waiting_for_insurance_life_info)
+            await state.update_data(need_life_info=True)
+        else:
+            await state.set_state(Form.waiting_for_insurance_documents)
 
-        text += "\n📧 7511327@mail.ru"
+        text += f"\n📧 Или отправьте на: 7511327@mail.ru"
 
-        await state.set_state(Form.waiting_for_insurance_documents)
         await message.answer(text, reply_markup=get_documents_menu(), parse_mode="HTML")
-
     except ValueError:
-        await message.answer("❌ Введите корректную сумму")
+        await message.answer("❌ Введите число\n\nПример: 2500000")
 
 
-# DEALS HANDLERS
+@dp.message(Form.waiting_for_insurance_life_info)
+async def process_insurance_life_info(message: Message, state: FSMContext):
+    await state.update_data(life_info=message.text)
+    await state.set_state(Form.waiting_for_insurance_documents)
+    await message.answer(
+        "✅ Информация сохранена\n\n"
+        "📎 Теперь прикрепите документы или отправьте заявку:",
+        reply_markup=get_documents_menu(), parse_mode="HTML"
+    )
+
+
+# ========== СДЕЛКИ ==========
+
 @dp.callback_query(F.data.startswith("deals_"))
-async def process_deals_service(callback: CallbackQuery, state: FSMContext):
-    deals_type = callback.data.split("_")[1]
+async def select_deals_service(callback: CallbackQuery, state: FSMContext):
+    srv = callback.data.split("_")[1]
 
-    if deals_type == "egrn":
-        admin_text = "📑 <b>Запрос выписки из ЕГРН</b>"
-        text = (
-            "📑 <b>Выписки из ЕГРН</b>\n━━━━━━━━━━━━━━\n\n"
-            "🤖 Перейдите в бота:\n\n"
-            "👉 @EGRN_365bot"
-        )
+    if srv == 'egrn':
+        text = "📑 <b>Выписки из ЕГРН</b>\n\n🤖 Перейдите в бот:\n👉 @EGRN_365bot"
     else:
-        admin_text = "📊 <b>Запрос анализа сделок</b>"
-        text = (
-            "📊 <b>Анализ сделок</b>\n━━━━━━━━━━━━━━\n\n"
-            "🤖 Перейдите в бота:\n\n"
-            "👉 @realestate_deals_bot"
-        )
+        text = "📊 <b>Анализ сделок за квартал</b>\n\n🤖 Перейдите в бот:\n👉 @realestate_deals_bot"
 
-    await send_to_admins(admin_text, get_user_info(callback.from_user))
+    await send_to_admins(
+        f"🏢 <b>Сделки с недвижимостью</b>\n\nЗапрос: {'Выписки ЕГРН' if srv == 'egrn' else 'Анализ сделок'}",
+        get_user_info(callback.from_user)
+    )
 
     await callback.message.edit_text(text, reply_markup=get_main_menu_button(), parse_mode="HTML")
     await state.clear()
     await callback.answer()
 
 
-# DOCUMENTS HANDLERS
-@dp.callback_query(F.data.in_(["attach_docs", "submit_no_docs"]))
-async def process_documents_buttons(callback: CallbackQuery, state: FSMContext):
-    if callback.data == "attach_docs":
-        current_state = await state.get_state()
-        if current_state == Form.waiting_for_insurance_documents:
-            text = "📎 <b>Прикрепление документов</b>\n━━━━━━━━━━━━━━\n\n📤 Отправьте документы\n\n✅ После - нажмите /done"
-        else:
-            text = "📎 <b>Прикрепление документов</b>\n━━━━━━━━━━━━━━\n\n📤 Отправьте документы\n\n✅ После - нажмите /done"
-        await callback.message.edit_text(text, parse_mode="HTML")
-        await callback.answer()
+# ========== ОБРАБОТКА АДРЕСА ==========
+
+@dp.message(Form.waiting_for_address)
+async def process_address(message: Message, state: FSMContext):
+    address = message.text.strip()
+    await state.update_data(address=address)
+
+    processing = await message.answer("🔍 Определяем местоположение...")
+
+    lat, lon, full_address = await geocode_address(address)
+
+    if lat:
+        distance = round(calculate_distance(CHELYABINSK_CENTER[0], CHELYABINSK_CENTER[1], lat, lon), 1)
+        in_city = is_in_chelyabinsk(full_address)
+        await state.update_data(full_address=full_address, distance=distance, in_city=in_city)
     else:
-        user_data = await state.get_data()
+        distance = 0
+        in_city = True
+        full_address = address
+        await state.update_data(distance=0, in_city=True)
 
-        admin_text = await format_admin_message(user_data)
-        await send_to_admins(admin_text, get_user_info(callback.from_user))
+    await processing.delete()
 
-        text = (
-            "✅ <b>Заявка принята!</b>\n━━━━━━━━━━━━━━\n\n"
-            "📞 Специалист свяжется с вами в ближайшее время"
-        )
-        await callback.message.edit_text(text, reply_markup=get_main_menu_button(), parse_mode="HTML")
-        await state.clear()
-        await callback.answer()
+    data = await state.get_data()
+    service = data.get('service_type', '')
 
-
-@dp.message(Form.waiting_for_documents, F.document | F.photo)
-async def handle_documents(message: Message, state: FSMContext):
-    await message.answer("✅ Документ получен")
-
-
-@dp.message(Form.waiting_for_insurance_documents, F.document | F.photo)
-async def handle_insurance_documents(message: Message, state: FSMContext):
-    await message.answer("✅ Документ получен")
-
-
-@dp.message(Form.waiting_for_insurance_documents)
-async def handle_insurance_text_info(message: Message, state: FSMContext):
-    await message.answer("✅ Информация сохранена")
-
-
-@dp.message(Command("done"))
-async def cmd_done(message: Message, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state in [Form.waiting_for_documents, Form.waiting_for_insurance_documents]:
-        user_data = await state.get_data()
-
-        admin_text = await format_admin_message(user_data)
-        admin_text += "\n\n📎 Пользователь прикрепил документы"
-        await send_to_admins(admin_text, get_user_info(message.from_user))
-
-        if current_state == Form.waiting_for_insurance_documents:
-            text = (
-                "✅ <b>Заявка на страхование принята!</b>\n━━━━━━━━━━━━━━\n\n"
-                "💼 Специалист рассчитает точную стоимость и свяжется с вами\n\n"
-                "📞 Время обработки:\n"
-                "• Рабочие дни 9-18: до 30 мин\n"
-                "• Нерабочее время: на следующий день"
+    if service == 'evaluation':
+        if data.get('bank_code'):
+            base, travel, total = calculate_mortgage_cost(
+                data['bank_code'], data.get('object_code', 'flat'),
+                data.get('mpurpose_code', 'new'), distance, in_city
             )
         else:
-            text = "✅ <b>Заявка принята!</b>\n━━━━━━━━━━━━━━\n\n📞 Специалист свяжется с вами"
+            base, travel, total = calculate_other_cost(
+                data.get('object_code', 'flat'), data.get('report_code', 'full'), distance, in_city
+            )
+        await state.update_data(cost=total)
 
-        await message.answer(text, reply_markup=get_main_menu_button(), parse_mode="HTML")
-        await state.clear()
+        text = f"📌 <b>Адрес определён</b>\n\n"
+        text += f"📍 {full_address}\n"
+        text += f"📏 Расстояние от центра: {distance} км\n\n"
+        text += f"💰 <b>Стоимость: {total} ₽</b>\n\n"
+        text += "Срок готовности 1-2 дня после осмотра.\n"
+        text += "Доплата за площадь свыше 150 кв.м — 1000 ₽ за каждые 150 кв.м.\n\n"
+        text += "📅 Введите желаемую дату и время осмотра:"
+
+        await state.set_state(Form.waiting_for_date)
+        await message.answer(text, reply_markup=get_back_button(), parse_mode="HTML")
+
+    elif service == 'flood':
+        rooms = data.get('rooms', 1)
+        base, rooms_cost, travel, total = calculate_flood_cost(
+            data.get('object_code', 'flat'), rooms, distance, in_city
+        )
+        await state.update_data(cost=total)
+
+        text = f"📌 {full_address}\n"
+        text += f"📏 Расстояние: {distance} км\n\n"
+        text += f"💰 <b>Стоимость: {total} ₽</b>\n"
+        text += "Срок готовности 3-5 дней после осмотра.\n\n"
+        text += "📅 Введите дату и время осмотра:"
+
+        await state.set_state(Form.waiting_for_date)
+        await message.answer(text, reply_markup=get_back_button(), parse_mode="HTML")
+
+    elif service == 'bti':
+        bti_service = data.get('bti_service', '')
+
+        if bti_service == 'extract':
+            # Выписка из техпаспорта — сразу отправляем
+            await state.update_data(cost=500)
+            order_text = await format_order_text(await state.get_data())
+            await send_to_admins(order_text, get_user_info(message.from_user))
+
+            await message.answer(
+                "✅ <b>Заявка принята!</b>\n\n"
+                "При наличии выписки из техпаспорта её стоимость составит — 500 ₽.\n"
+                "Готовность в течении дня.\n\n"
+                "📞 Наш специалист свяжется с вами в ближайшее время",
+                reply_markup=get_main_menu_button(), parse_mode="HTML"
+            )
+            await state.clear()
+        else:
+            # Остальные услуги БТИ — сразу отправляем
+            order_text = await format_order_text(data)
+            await send_to_admins(order_text, get_user_info(message.from_user))
+
+            await message.answer(
+                "✅ <b>Заявка принята!</b>\n\n"
+                "📞 Наш специалист свяжется с вами в ближайшее время",
+                reply_markup=get_main_menu_button(), parse_mode="HTML"
+            )
+            await state.clear()
+
+    elif service == 'expertise':
+        exp_type = data.get('exp_type', '')
+
+        if exp_type == 'accept':
+            base, travel, total = calculate_acceptance_cost(data.get('acc_area', '150'), distance, in_city)
+        elif exp_type == 'inspect':
+            base, travel, total = calculate_inspection_cost(data.get('insp_area', '150'), distance, in_city)
+        elif exp_type == 'thermal':
+            base, travel, total = calculate_thermal_cost(
+                data.get('therm_object', 'flat'), data.get('therm_area', '100'), distance, in_city
+            )
+        else:
+            total = 0
+
+        await state.update_data(cost=total)
+
+        if total > 0:
+            text = f"📌 {full_address}\n"
+            text += f"📏 Расстояние: {distance} км\n\n"
+            text += f"💰 <b>Стоимость: {total} ₽</b>\n\n"
+            text += "📅 Введите желаемую дату и время осмотра:"
+
+            await state.set_state(Form.waiting_for_date)
+            await message.answer(text, reply_markup=get_back_button(), parse_mode="HTML")
+        else:
+            await state.update_data(documents=[])
+            await state.set_state(Form.waiting_for_documents)
+            await message.answer(
+                "📎 Прикрепите документы или отправьте заявку:",
+                reply_markup=get_documents_menu(), parse_mode="HTML"
+            )
+
+
+# ========== ДАТА ==========
+
+@dp.message(Form.waiting_for_date)
+async def process_date(message: Message, state: FSMContext):
+    date = message.text.strip()
+    await state.update_data(date=date, documents=[])
+    await state.set_state(Form.waiting_for_documents)
+
+    data = await state.get_data()
+    service = data.get('service_type', '')
+    mpurpose = data.get('mpurpose_code', '')
+
+    if service == 'evaluation' and data.get('bank_code'):
+        if mpurpose in ['new', 'refi']:
+            docs_list = (
+                "📋 <b>Необходимые документы:</b>\n"
+                "• Выписка из ЕГРН\n"
+                "• Техпаспорт / выписка из техпаспорта / техплан\n"
+                "• Паспорт собственника и заёмщика (стр. 3-4 и прописка)"
+            )
+        else:  # zaklad
+            docs_list = (
+                "📋 <b>Для квартиры:</b>\n"
+                "• Договор ДУ / уступки / купли-продажи\n"
+                "• Акт приёма-передачи\n"
+                "• Паспорт заёмщика\n\n"
+                "<b>Для жилого дома:</b>\n"
+                "• Выписка ЕГРН на дом и ЗУ\n"
+                "• Технический план\n"
+                "• Паспорт заёмщика"
+            )
+    elif service == 'flood':
+        docs_list = (
+            "📋 <b>Необходимые документы:</b>\n"
+            "• Выписка из ЕГРН\n"
+            "• Паспорт заказчика\n"
+            "• Акт от управляющей компании\n"
+            "• Технический паспорт (при наличии)"
+        )
     else:
-        await message.answer("⚠️ Нет активной заявки")
+        docs_list = "📋 Прикрепите необходимые документы"
 
+    text = f"📅 Дата: {date}\n\n{docs_list}\n\n📧 Или на почту: 7511327@mail.ru"
+    await message.answer(text, reply_markup=get_documents_menu(), parse_mode="HTML")
+
+
+# ========== ДОКУМЕНТЫ ==========
+
+@dp.callback_query(F.data == "attach_docs")
+async def start_attach_docs(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "📎 <b>Прикрепление документов</b>\n\n"
+        "Отправьте фото или файлы.\n"
+        "После загрузки всех документов нажмите «Готово»",
+        reply_markup=get_finish_docs_menu(), parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "add_more_docs")
+async def add_more_docs(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "📎 Отправьте ещё документы\n\nИли нажмите «Готово» для отправки заявки",
+        reply_markup=get_finish_docs_menu(), parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.message(Form.waiting_for_documents, F.photo)
+async def handle_doc_photo(message: Message, state: FSMContext):
+    data = await state.get_data()
+    docs = data.get('documents', [])
+    docs.append({'type': 'photo', 'file_id': message.photo[-1].file_id, 'caption': ''})
+    await state.update_data(documents=docs)
+    await message.answer(
+        f"✅ Фото добавлено ({len(docs)} файлов)\n\nДобавьте ещё или нажмите «Готово»",
+        reply_markup=get_finish_docs_menu()
+    )
+
+
+@dp.message(Form.waiting_for_documents, F.document)
+async def handle_doc_file(message: Message, state: FSMContext):
+    data = await state.get_data()
+    docs = data.get('documents', [])
+    docs.append({'type': 'document', 'file_id': message.document.file_id, 'caption': message.document.file_name or ''})
+    await state.update_data(documents=docs)
+    await message.answer(
+        f"✅ Файл добавлен ({len(docs)} файлов)\n\nДобавьте ещё или нажмите «Готово»",
+        reply_markup=get_finish_docs_menu()
+    )
+
+
+@dp.message(Form.waiting_for_insurance_documents, F.photo)
+async def handle_ins_photo(message: Message, state: FSMContext):
+    data = await state.get_data()
+    docs = data.get('documents', [])
+    docs.append({'type': 'photo', 'file_id': message.photo[-1].file_id, 'caption': ''})
+    await state.update_data(documents=docs)
+    await message.answer(
+        f"✅ Фото добавлено ({len(docs)})\n\nДобавьте ещё или отправьте заявку",
+        reply_markup=get_finish_docs_menu()
+    )
+
+
+@dp.message(Form.waiting_for_insurance_documents, F.document)
+async def handle_ins_file(message: Message, state: FSMContext):
+    data = await state.get_data()
+    docs = data.get('documents', [])
+    docs.append({'type': 'document', 'file_id': message.document.file_id, 'caption': message.document.file_name or ''})
+    await state.update_data(documents=docs)
+    await message.answer(
+        f"✅ Файл добавлен ({len(docs)})\n\nДобавьте ещё или отправьте заявку",
+        reply_markup=get_finish_docs_menu()
+    )
+
+
+# ========== ОТПРАВКА ЗАЯВКИ ==========
+
+@dp.callback_query(F.data == "submit_order")
+async def submit_order(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    user_info = get_user_info(callback.from_user)
+    order_text = await format_order_text(data)
+
+    await send_to_admins(order_text, user_info)
+
+    docs = data.get('documents', [])
+    if docs:
+        await send_documents_to_admins(docs, user_info, order_text)
+
+    cost_info = f"\n💰 Стоимость: {data.get('cost')} ₽" if data.get('cost') else ""
+
+    await callback.message.edit_text(
+        f"✅ <b>Заявка принята!</b>{cost_info}\n\n"
+        f"📎 Документов: {len(docs)}\n\n"
+        "📞 Наш специалист свяжется с вами в ближайшее время\n\n"
+        "⏰ <b>Время обработки:</b>\n"
+        "• Рабочие дни 9-18: до 30 мин\n"
+        "• Нерабочее время и выходные: на след. рабочий день",
+        reply_markup=get_main_menu_button(), parse_mode="HTML"
+    )
+    await state.clear()
+    await callback.answer("✅ Заявка отправлена!")
+
+
+# ========== ЗАПУСК ==========
 
 async def main():
+    logger.info("Bot starting...")
     await dp.start_polling(bot)
 
 
