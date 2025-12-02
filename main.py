@@ -617,13 +617,17 @@ OBJECT_NAMES = {
 
 # Группы банков по ТЗ
 BANK_GROUP_CHEAP = ['sber', 'rshb', 'chelinvest', 'rosvoen']  # 2500 для квартиры при оформлении ипотеки
-BANK_GROUP_SPECIAL = ['vtb', 'domrf', 'alfa', 'primsoc']  # Особые условия для закладной и рефи
+BANK_GROUP_SPECIAL = ['vtb', 'domrf', 'alfa', 'primsoc']  # Особые условия
 
 
 # ========== РАСЧЁТ СТОИМОСТИ ==========
 
 def calculate_mortgage_cost(bank_code, obj_code, mpurpose_code, distance_km, in_city):
-    """Расчёт стоимости оценки для банка по ТЗ"""
+    """
+    Расчёт стоимости оценки для банка по ТЗ
+    
+    ✅ ИСПРАВЛЕНО: Цены для земельного участка при оформлении ипотеки
+    """
     
     # Расчёт выезда
     if in_city:
@@ -633,17 +637,26 @@ def calculate_mortgage_cost(bank_code, obj_code, mpurpose_code, distance_km, in_
     
     # Базовая стоимость по ТЗ
     if mpurpose_code == 'new':  # Оформление ипотеки
-        if obj_code == 'flat':  # Пункт 1 - квартира
+        if obj_code == 'flat':  # Квартира, комната
             base = 2500 if bank_code in BANK_GROUP_CHEAP else 2900
-        elif obj_code == 'land':  # Пункт 2 - земельный участок
+            
+        elif obj_code == 'land':  # ✅ ИСПРАВЛЕНО: Земельный участок
+            # Для земельного участка при новой ипотеке применяются цены как для закладной
+            if bank_code in BANK_GROUP_SPECIAL:
+                base = 4000
+            else:
+                base = 3000
+                
+        elif obj_code == 'house':  # Жилой дом
             base = 2500 if bank_code in BANK_GROUP_CHEAP else 2900
-        elif obj_code == 'house':  # Пункт 3 - жилой дом
-            base = 2500 if bank_code in BANK_GROUP_CHEAP else 2900
-        elif obj_code == 'commercial':  # Пункт 4 - нежилое помещение
+            
+        elif obj_code == 'commercial':  # Нежилое помещение
             base = 6000
-        elif obj_code == 'building':  # Пункт 5 - нежилое здание
+            
+        elif obj_code == 'building':  # Нежилое здание
             base = 7000
-        elif obj_code in ['garage', 'parking']:  # Пункт 6, 7
+            
+        elif obj_code in ['garage', 'parking']:  # Гараж, машиноместо
             base = 3500
         else:
             base = 2900
@@ -653,7 +666,6 @@ def calculate_mortgage_cost(bank_code, obj_code, mpurpose_code, distance_km, in_
             base = 4000
         else:
             base = 3000
-            travel = 0  # Для остальных банков выезд = 0
             
     elif mpurpose_code == 'refi':  # Рефинансирование
         if bank_code in BANK_GROUP_SPECIAL:
@@ -1191,6 +1203,20 @@ async def back_to_flood_rooms(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+# ✅ ИСПРАВЛЕНО БАГ #1: Добавлен обработчик "Назад" для затопления (от даты к адресу)
+@dp.callback_query(F.data == "back_to_flood_date")
+async def back_to_flood_date(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await state.set_state(Form.waiting_for_address)
+    await callback.message.edit_text(
+        f"Объект: {data.get('object_name', '')}\n"
+        f"Помещений: {data.get('rooms', 1)}\n\n"
+        f"<b>{get_address_hint()}</b>",
+        reply_markup=get_back_and_main_buttons("back_to_flood_rooms"), parse_mode="HTML"
+    )
+    await callback.answer()
+
+
 # ========== БТИ / КАДАСТР / МЕЖЕВАНИЕ ==========
 
 @dp.callback_query(F.data == "back_to_bti")
@@ -1203,50 +1229,8 @@ async def back_to_bti(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("bti_") & ~F.data.startswith("bti_passport") & ~F.data.startswith("bti_plan") & ~F.data.startswith("bti_survey") & ~F.data.startswith("bti_acts"))
-async def select_bti_service(callback: CallbackQuery, state: FSMContext):
-    bti = callback.data.split("_")[1]
-    
-    if bti == 'extract':
-        await state.update_data(bti_service='extract', bti_service_name='Выписка из технического паспорта (архивная до 2014г.)')
-        await state.set_state(Form.waiting_for_address)
-        await callback.message.edit_text(
-            "<b>Выписка из технического паспорта (архивная до 2014г.)</b>\n\n" + get_address_hint(),
-            reply_markup=get_back_and_main_buttons("back_to_bti"), parse_mode="HTML"
-        )
-    elif bti == 'passport':
-        await state.update_data(bti_service='passport', bti_service_name='Технический паспорт')
-        await state.set_state(Form.waiting_for_bti_passport_action)
-        await callback.message.edit_text(
-            "<b>Технический паспорт</b>",
-            reply_markup=get_bti_passport_action_menu(), parse_mode="HTML"
-        )
-    elif bti == 'plan':
-        await state.update_data(bti_service='plan', bti_service_name='Технический план')
-        await state.set_state(Form.waiting_for_bti_plan_action)
-        await callback.message.edit_text(
-            "<b>Технический план</b>",
-            reply_markup=get_bti_plan_action_menu(), parse_mode="HTML"
-        )
-    elif bti == 'survey':
-        await state.update_data(bti_service='survey', bti_service_name='Межевание (земля)')
-        await state.set_state(Form.waiting_for_bti_survey_action)
-        await callback.message.edit_text(
-            "<b>Межевание (земля)</b>",
-            reply_markup=get_bti_survey_action_menu(), parse_mode="HTML"
-        )
-    elif bti == 'acts':
-        await state.update_data(bti_service='acts', bti_service_name='Акты, справки')
-        await state.set_state(Form.waiting_for_bti_acts_action)
-        await callback.message.edit_text(
-            "<b>Акты, справки</b>",
-            reply_markup=get_bti_acts_action_menu(), parse_mode="HTML"
-        )
-    
-    await callback.answer()
-
-
-# Технический паспорт
+# ✅ ИСПРАВЛЕНО БАГ #2: Специфичные обработчики БТИ ПЕРЕД общим
+# Технический паспорт - специфичные обработчики
 @dp.callback_query(F.data == "bti_passport_price")
 async def bti_passport_price(callback: CallbackQuery, state: FSMContext):
     await send_price_image(callback, '(Прайс тех.паспорт).JPG')
@@ -1273,7 +1257,7 @@ async def back_to_bti_passport(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-# Технический план
+# Технический план - специфичные обработчики
 @dp.callback_query(F.data == "bti_plan_price")
 async def bti_plan_price(callback: CallbackQuery, state: FSMContext):
     await send_price_image(callback, '(Прайс тех.план).JPG')
@@ -1329,7 +1313,7 @@ async def back_to_bti_plan_object(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-# Межевание
+# Межевание - специфичные обработчики
 @dp.callback_query(F.data == "bti_survey_price")
 async def bti_survey_price(callback: CallbackQuery, state: FSMContext):
     await send_price_image(callback, '(Прайс межевание).JPG')
@@ -1387,7 +1371,7 @@ async def back_to_bti_survey_service(callback: CallbackQuery, state: FSMContext)
     await callback.answer()
 
 
-# Акты, справки
+# Акты, справки - специфичные обработчики
 @dp.callback_query(F.data == "bti_acts_price")
 async def bti_acts_price(callback: CallbackQuery, state: FSMContext):
     await send_price_image(callback, '(Прайс Акты, справки).JPG')
@@ -1440,6 +1424,50 @@ async def select_acts_service(callback: CallbackQuery, state: FSMContext):
         reply_markup=get_main_menu_button(), parse_mode="HTML"
     )
     await state.clear()
+    await callback.answer()
+
+
+# Общий обработчик БТИ (теперь ПОСЛЕ всех специфичных)
+@dp.callback_query(F.data.startswith("bti_"))
+async def select_bti_service(callback: CallbackQuery, state: FSMContext):
+    bti = callback.data.split("_")[1]
+    
+    if bti == 'extract':
+        await state.update_data(bti_service='extract', bti_service_name='Выписка из технического паспорта (архивная до 2014г.)')
+        await state.set_state(Form.waiting_for_address)
+        await callback.message.edit_text(
+            "<b>Выписка из технического паспорта (архивная до 2014г.)</b>\n\n" + get_address_hint(),
+            reply_markup=get_back_and_main_buttons("back_to_bti"), parse_mode="HTML"
+        )
+    elif bti == 'passport':
+        await state.update_data(bti_service='passport', bti_service_name='Технический паспорт')
+        await state.set_state(Form.waiting_for_bti_passport_action)
+        await callback.message.edit_text(
+            "<b>Технический паспорт</b>",
+            reply_markup=get_bti_passport_action_menu(), parse_mode="HTML"
+        )
+    elif bti == 'plan':
+        await state.update_data(bti_service='plan', bti_service_name='Технический план')
+        await state.set_state(Form.waiting_for_bti_plan_action)
+        await callback.message.edit_text(
+            "<b>Технический план</b>",
+            reply_markup=get_bti_plan_action_menu(), parse_mode="HTML"
+        )
+    elif bti == 'survey':
+        await state.update_data(bti_service='survey', bti_service_name='Межевание (земля)')
+        await state.set_state(Form.waiting_for_bti_survey_action)
+        await callback.message.edit_text(
+            "<b>Межевание (земля)</b>",
+            reply_markup=get_bti_survey_action_menu(), parse_mode="HTML"
+        )
+    elif bti == 'acts':
+        await state.update_data(bti_service='acts', bti_service_name='Акты, справки')
+        await state.set_state(Form.waiting_for_bti_acts_action)
+        await callback.message.edit_text(
+            "<b>Акты, справки</b>",
+            reply_markup=get_bti_acts_action_menu(), parse_mode="HTML"
+        )
+    
     await callback.answer()
 
 
@@ -1664,6 +1692,18 @@ async def select_expertise_goal(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "back_to_exp_goals")
 async def back_to_exp_goals(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(Form.waiting_for_expertise_goals)
+    await callback.message.edit_text(
+        "<b>Что нужно определить или исследовать в рамках экспертизы?</b>\n"
+        "(можно выбрать несколько вариантов, затем нажмите «Продолжить»)",
+        reply_markup=get_expertise_goals_menu(), parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+# ✅ ИСПРАВЛЕНО БАГ #1: Добавлен обработчик "Назад" для экспертизы
+@dp.callback_query(F.data == "back_to_exp_description")
+async def back_to_exp_description(callback: CallbackQuery, state: FSMContext):
     await state.set_state(Form.waiting_for_expertise_goals)
     await callback.message.edit_text(
         "<b>Что нужно определить или исследовать в рамках экспертизы?</b>\n"
@@ -2116,7 +2156,7 @@ async def process_address(message: Message, state: FSMContext):
         text += "<b>Введите желаемую дату и время осмотра:</b>"
 
         await state.set_state(Form.waiting_for_date)
-        await message.answer(text, reply_markup=get_back_and_main_buttons(), parse_mode="HTML")
+        await message.answer(text, reply_markup=get_back_and_main_buttons("back_to_flood_date"), parse_mode="HTML")
 
     elif service == 'bti':
         bti_service = data.get('bti_service', '')
